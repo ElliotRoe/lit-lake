@@ -1,0 +1,52 @@
+# Rust build artifacts
+/target/
+
+# Debug and profiling
+**/*.rs.bk
+*.pdb
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Rust-analyzer
+.rust-analyzer/
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# FastEmbed model cache (can be large!)
+.cache/
+.fastembed_cache/
+cache/
+models/
+
+# Environment and config
+.env
+.env.local
+
+# OS-specific
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+build/
+
+build/bin
+node_modules
+frontend/build

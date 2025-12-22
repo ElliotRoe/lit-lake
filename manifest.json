@@ -1,0 +1,36 @@
+{
+  "manifest_version": "0.2",
+  "name": "lit-lake",
+  "version": "0.0.2",
+  "description": "A MCP to connect your reference managers to Claude",
+  "author": {
+    "name": "Elliot Roe"
+  },
+  "server": {
+    "type": "binary",
+    "entry_point": "lit-lake-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/lit-lake-mcp",
+      "args": [],
+      "env": {
+        "ZOTERO_DB_PATH": "${user_config.z_db}",
+        "DB_PATH": "${HOME}/lit_lake.db"
+      },
+      "platform_overrides": {
+        "win32": {
+          "command": "${__dirname}/lit-lake-mcp.exe"
+        }
+      }
+    }
+  },
+  "user_config": {
+    "z_db": {
+      "type": "file",
+      "title": "Zotero DB",
+      "description": "The Zotero db file",
+      "required": false,
+      "sensitive": false
+    }
+  },
+  "license": "MIT"
+}

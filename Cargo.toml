@@ -1,0 +1,16 @@
+[package]
+name = "lit-lake-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rusqlite = { version = "0.31.0", features = ["bundled", "functions"] }
+dotenvy = "0.15"
+base64 = "0.22"
+hayro = "0.4"
+fastembed = "5"
+sqlite-vec = "0.1"
+dirs = "5"
