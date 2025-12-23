@@ -1,4 +1,8 @@
 # Lit Lake: Search & Analyze Literature Libraries with Claude
+
+> ⚠️ **UNDER CONSTRUCTION** ⚠️  
+> This project (and the README itself for that matter) is actively being developed. Features may be incomplete, documentation may be outdated, and breaking changes may occur. Use at your own risk and check back for updates!
+
 Connect [Claude](https://www.anthropic.com/claude) (and others) to [Zotero](https://www.zotero.org/) with one click. Discover related papers through semantic search, analyze references with full context and allow Claude to access the full text (including embedded images) of your library.
 
 ## Installation
@@ -23,11 +27,15 @@ To use Lit Lake with other LLM clients (like LM Studio, Cherry studio, etc), you
 #### Paper Discovery & Search 
 The search ability is great for discovering individual or groups of papers based on a topic. For every paper, depending on what is available in Zotero, Claude can search for keywords and search semantically within the titles and abstracts of your references. Notably, due to how I've implemented this tool, Claude also has the ability to combine these to two types of search in arbitrary and programatic ways, for more on this, see the advanced example.
 
-**Basic Keyword Search Example** 
+*Examples*
+**Keyword Search** 
 > "Can you find all articles in my library that have the keyword 'pedagogical content knowledge' or 'PCK' within their abstract?"
 
-**Basic Example** 
-> "Can you find all articles in my library that have the keyword 'pedagogical content knowledge' or 'PCK' within their abstract?"
+**Semantic Search** 
+> "Can you find me articles in my library related to out of field teaching?"
+
+**Advanced Search** 
+> "Find me all articles that have keywords 'pedagogical content knowledge' or 'PCK' within their abstract and are related to out of field teaching or teaching self-efficacy."
 ### The Thesis
 Hey! Glad you made it this far down in the `README.md` :) I know this is a lot of text, but for the folks that care, here's the "why" behind this tool. My thesis on the state of AI tools right now and where I'd like this to go. 
 
