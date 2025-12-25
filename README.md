@@ -13,13 +13,27 @@ Claude is the easiest and fastest way to get set up with Lit Lake. If you do not
 
 #### Via MCPB
 1. If you do not have Claude desktop installed, install it [here](https://claude.com/download)
-2. Click [here](ttps://github.com/ElliotRoe/lit-lake/releases/latest) to view the latest version of Lit Lake
+2. Click [here](https://github.com/ElliotRoe/lit-lake/releases/latest) to view the latest version of Lit Lake
 3. Click the file that ends with `.mcpb`
 4. Wait for it to download
 5. Double click the downloaded file
 6. Click 'Install'
 
 > Note: If double clicking does not immediately bring you to the installation screen within Claude, go to Settings > Extensions > Advanced settings > Install Extension
+
+#### Configuration
+During installation, you may be prompted to configure the **Zotero DB** path. This is **optional** — if your Zotero is installed in the default location (`~/Zotero/`), Lit Lake will find it automatically.
+
+If you've moved your Zotero data directory or use a custom location, set this to the path of your `zotero.sqlite` file. For example:
+- **macOS/Linux**: `/Users/yourname/Custom/Zotero/zotero.sqlite`
+- **Windows**: `C:\Users\yourname\Zotero\zotero.sqlite`
+
+#### First Run
+On first launch, Lit Lake will:
+1. **Automatically sync your Zotero library** — no manual action needed
+2. **Download AI models** (~500MB total) — this happens once and may take a few minutes
+
+You can check progress by asking Claude to call `library_status`. Once `init_status` shows "Ready", semantic search is available.
 
 ### Other LLMs
 To use Lit Lake with other LLM clients (like LM Studio, Cherry studio, etc), you'll just need to download the binary file and make it executable then configure it globally. Honestly, I haven't configured it yet with another client, if you are attempting, please reach out and I can help, then I'll add the instructions back here.

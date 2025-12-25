@@ -22,6 +22,38 @@ use crate::db::init_db;
 use crate::embeddings::{EmbeddingWorker, WorkerConfig, WorkerSignal};
 use crate::zotero::ZoteroReader;
 
+/// Initialization status for async startup
+#[derive(Clone, Debug)]
+enum InitStatus {
+    SyncingZotero,
+    LoadingEmbeddingModel,
+    LoadingRerankerModel,
+    StartingWorker,
+    Ready,
+    Failed(String),
+}
+
+impl InitStatus {
+    fn message(&self) -> &str {
+        match self {
+            InitStatus::SyncingZotero => "Syncing Zotero library...",
+            InitStatus::LoadingEmbeddingModel => "Loading embedding model (may download on first run)...",
+            InitStatus::LoadingRerankerModel => "Loading reranker model (may download on first run)...",
+            InitStatus::StartingWorker => "Starting embedding worker...",
+            InitStatus::Ready => "Ready",
+            InitStatus::Failed(msg) => msg,
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        matches!(self, InitStatus::Ready)
+    }
+
+    fn is_failed(&self) -> bool {
+        matches!(self, InitStatus::Failed(_))
+    }
+}
+
 /// Paths for the LitLake application data directory.
 struct LitLakePaths {
     /// Root directory (e.g., ~/LitLake)
@@ -178,7 +210,8 @@ struct JsonRpcResponse {
 
 struct AppState {
     conn: Arc<Mutex<Connection>>,
-    worker_tx: mpsc::Sender<WorkerSignal>,
+    worker_tx: Arc<Mutex<Option<mpsc::Sender<WorkerSignal>>>>,
+    init_status: Arc<Mutex<InitStatus>>,
 }
 
 /// Register `embed(text)` and `rerank_score(query, doc)` scalar functions on the connection.
@@ -226,386 +259,11 @@ fn register_ai_functions(
     Ok(())
 }
 
-fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-
-    // Initialize LitLake paths (creates directories as needed)
-    let paths = LitLakePaths::init()?;
-    let db_path = paths.db.to_string_lossy().to_string();
-    let models_path = paths.models.clone();
-
-    eprintln!("[main] Using database: {}", db_path);
-    eprintln!("[main] Using models directory: {:?}", models_path);
-
-    // Register sqlite-vec extension once per process.
-    unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
-    }
-
-    // Spawn embedding worker (background doc indexing).
-    let (worker_tx, worker_rx) = mpsc::channel::<WorkerSignal>();
-    {
-        let cfg = WorkerConfig {
-            db_path: db_path.clone(),
-            models_path: models_path.clone(),
-            ..Default::default()
-        };
-        thread::spawn(move || {
-            let worker = EmbeddingWorker::new(cfg, worker_rx);
-            if let Err(e) = worker.run() {
-                eprintln!("[embeddings] Worker exited with error: {e:?}");
-            }
-        });
-    }
-
-    // Load AI models eagerly (like original script).
-    eprintln!("[main] Loading embedding model...");
-    let embedder = Arc::new(Mutex::new(TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::BGESmallENV15)
-            .with_cache_dir(models_path.clone())
-            .with_show_download_progress(true),
-    )?));
-
-    eprintln!("[main] Loading reranker model...");
-    let reranker = Arc::new(Mutex::new(TextRerank::try_new(
-        RerankInitOptions::new(RerankerModel::BGERerankerBase)
-            .with_cache_dir(models_path)
-            .with_show_download_progress(true),
-    )?));
-
-    // Open main connection and register scalar functions.
-    let conn = Connection::open(&db_path)?;
-    init_db(&conn)?;
-    register_ai_functions(&conn, embedder.clone(), reranker.clone())?;
-
-    let app_state = Arc::new(AppState {
-        conn: Arc::new(Mutex::new(conn)),
-        worker_tx,
-    });
-
-    // Kick the worker once on startup to process any backlog.
-    let _ = app_state.worker_tx.send(WorkerSignal::Wake);
-
-    eprintln!("[main] Server ready. Waiting for messages...");
-
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
-
-    while let Some(line) = lines.next() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let req: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Failed to parse JSON: {}", e);
-                continue;
-            }
-        };
-
-        eprintln!("Received: {} ({:?})", req.method, req.id);
-
-        let response = match req.method.as_str() {
-            "initialize" => handle_initialize(&req),
-            "notifications/initialized" => None,
-            "tools/list" => handle_list_tools(&req),
-            "tools/call" => handle_call_tool(&req, app_state.clone()),
-            _ => handle_unknown(&req),
-        };
-
-        if let Some(resp) = response {
-            let json_str = serde_json::to_string(&resp)?;
-            let mut stdout = io::stdout();
-            stdout.write_all(json_str.as_bytes())?;
-            stdout.write_all(b"\n")?;
-            stdout.flush()?;
-        }
-    }
-
-    Ok(())
-}
-
-fn handle_initialize(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
-    Some(JsonRpcResponse {
-        jsonrpc: "2.0".to_string(),
-        id: req.id.clone(),
-        error: None,
-        result: Some(json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "lit-lake-mcp", "version": "0.4.0" }
-        })),
-    })
-}
-
-fn handle_list_tools(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
-    Some(JsonRpcResponse {
-        jsonrpc: "2.0".to_string(),
-        id: req.id.clone(),
-        error: None,
-        result: Some(json!({
-            "tools": [
-                {
-                    "name": "sync_zotero",
-                    "description": "Import/update references from Zotero into the local library. Creates title and abstract documents for each reference, which are then embedded asynchronously for semantic search. Call this first if the library seems empty or out of date.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                },
-                {
-                    "name": "sql_search",
-                    "description": r#"Query the research library with full SQL flexibility. Supports semantic search via embed() and rerank_score() scalar functions.
-
-**First time?** Call get_documentation with section='workflows' to understand typical workflows for this tool before writing queries.
-
-## Quick Reference
-
-embed(text) → BLOB: Compute embedding for semantic similarity.
-rerank_score(query, doc) → REAL: Cross-encoder relevance score.
-
-```sql
-SELECT r.title, r.authors, r.year, d.content,
-       rerank_score('your question', d.content) AS relevance
-FROM vec_documents v
-JOIN documents d ON v.rowid = d.id
-JOIN reference_items r ON d.reference_id = r.id
-WHERE v.embedding MATCH embed('your question')
-  AND k = 30 AND d.embedding_status = 'ready'
-ORDER BY relevance DESC LIMIT 10;
-```
-
-Start broad, then refine. Don't over-specify on first attempt."#,
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": { "type": "string", "description": "A read-only SQL query. Use embed() for vector search and rerank_score() for relevance ordering." }
-                        },
-                        "required": ["query"]
-                    }
-                },
-                {
-                    "name": "get_documentation",
-                    "description": "Get detailed documentation including supported workflows, SQL examples, and database schema. Call with section='workflows' for step-by-step guidance on citation assistance and library research. Sections: 'workflows', 'schema', 'examples', or omit for overview.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "section": {
-                                "type": "string",
-                                "description": "Section to retrieve: 'workflows' (recommended first read), 'schema', 'examples', or omit for overview."
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "library_status",
-                    "description": "Get an overview of the library: how many references exist, what document types are available per reference, and embedding status. Use this to understand library scope before crafting queries, or to check if embeddings are ready after a sync.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                },
-                {
-                    "name": "preview_document_pdf_pages",
-                    "description": "Render PNG images of PDF pages to visually inspect full-text content. Use this to validate claims, check methodology, or verify specific details that aren't in the abstract. Requires document_file_id from the document_files table.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "document_file_id": { "type": "integer", "description": "The document_files.id for the PDF to preview." },
-                            "size": { "type": "integer", "description": "Max dimension in pixels (64-4096). Default 1024." },
-                            "start_page": { "type": "integer", "description": "First page to render (1-based). Default 1." },
-                            "end_page": { "type": "integer", "description": "Last page to render (1-based). Default = start_page. Max 10 pages per call." }
-                        },
-                        "required": ["document_file_id"]
-                    }
-                }
-            ]
-        })),
-    })
-}
-
-fn handle_call_tool(req: &JsonRpcRequest, state: Arc<AppState>) -> Option<JsonRpcResponse> {
-    let params = req.params.as_ref()?;
-    let name = params.get("name").and_then(|n| n.as_str())?;
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-
-    let result: Result<Value> = match name {
-        "sync_zotero" => tool_sync_zotero(state).map(text_tool_result),
-        "sql_search" => tool_sql_search(state, args).map(text_tool_result),
-        "get_documentation" => tool_get_documentation(args).map(text_tool_result),
-        "library_status" => tool_library_status(state).map(text_tool_result),
-        "preview_document_pdf_pages" => tool_preview_document_pdf_pages(state, args),
-        _ => Err(anyhow::anyhow!("Tool not found")),
-    };
-
-    match result {
-        Ok(content) => Some(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: req.id.clone(),
-            error: None,
-            result: Some(content),
-        }),
-        Err(e) => Some(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: req.id.clone(),
-            error: None,
-            result: Some(json!({
-                "isError": true,
-                "content": [{ "type": "text", "text": format!("Error: {}", e) }]
-            })),
-        }),
-    }
-}
-
-fn tool_library_status(state: Arc<AppState>) -> Result<String> {
-    let conn = state.conn.lock().unwrap();
-
-    let reference_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM reference_items", [], |row| row.get(0))?;
-    let document_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
-
-    let mut stmt = conn.prepare(
-        "SELECT
-            r.id,
-            r.title,
-            r.authors,
-            r.year,
-            r.source_system,
-            r.source_id,
-            d.id,
-            d.kind,
-            d.embedding_status,
-            d.updated_at
-         FROM reference_items r
-         LEFT JOIN documents d ON d.reference_id = r.id
-         ORDER BY r.updated_at DESC, r.id DESC, d.kind ASC, d.id ASC",
-    )?;
-
-    #[derive(Debug)]
-    struct Row {
-        reference_id: i64,
-        title: Option<String>,
-        authors: Option<String>,
-        year: Option<String>,
-        source_system: String,
-        source_id: String,
-        document_id: Option<i64>,
-        kind: Option<String>,
-        embedding_status: Option<String>,
-        updated_at: Option<String>,
-    }
-
-    let rows = stmt.query_map([], |row| {
-        Ok(Row {
-            reference_id: row.get(0)?,
-            title: row.get(1)?,
-            authors: row.get(2)?,
-            year: row.get(3)?,
-            source_system: row.get(4)?,
-            source_id: row.get(5)?,
-            document_id: row.get(6)?,
-            kind: row.get(7)?,
-            embedding_status: row.get(8)?,
-            updated_at: row.get(9)?,
-        })
-    })?;
-
-    let mut refs: Vec<Value> = Vec::new();
-    let mut current_ref_id: Option<i64> = None;
-    let mut current_ref: Option<serde_json::Map<String, Value>> = None;
-    let mut current_docs: Vec<Value> = Vec::new();
-
-    for r in rows {
-        let r = r?;
-        if current_ref_id != Some(r.reference_id) {
-            if let Some(mut cr) = current_ref.take() {
-                cr.insert("documents".to_string(), json!(current_docs));
-                refs.push(Value::Object(cr));
-                current_docs = Vec::new();
-            }
-            current_ref_id = Some(r.reference_id);
-            let mut m = serde_json::Map::new();
-            m.insert("reference_id".to_string(), json!(r.reference_id));
-            m.insert("title".to_string(), json!(r.title));
-            m.insert("authors".to_string(), json!(r.authors));
-            m.insert("year".to_string(), json!(r.year));
-            m.insert("source_system".to_string(), json!(r.source_system));
-            m.insert("source_id".to_string(), json!(r.source_id));
-            current_ref = Some(m);
-        }
-        if let Some(doc_id) = r.document_id {
-            current_docs.push(json!({
-                "document_id": doc_id,
-                "kind": r.kind,
-                "embedding_status": r.embedding_status,
-                "updated_at": r.updated_at,
-            }));
-        }
-    }
-    if let Some(mut cr) = current_ref.take() {
-        cr.insert("documents".to_string(), json!(current_docs));
-        refs.push(Value::Object(cr));
-    }
-
-    // Embedding counts
-    let mut count_stmt = conn.prepare(
-        "SELECT kind, embedding_status, COUNT(*) as count
-         FROM documents
-         GROUP BY kind, embedding_status
-         ORDER BY kind, embedding_status",
-    )?;
-    let count_rows = count_stmt.query_map([], |row| {
-        Ok(json!({
-            "kind": row.get::<_, Option<String>>(0)?,
-            "embedding_status": row.get::<_, Option<String>>(1)?,
-            "count": row.get::<_, i64>(2)?
-        }))
-    })?;
-    let embedding_counts: Vec<Value> = count_rows.filter_map(|r| r.ok()).collect();
-
-    // Recent errors
-    let mut err_stmt = conn.prepare(
-        "SELECT id, kind, embedding_error, embedding_updated_at
-         FROM documents
-         WHERE embedding_status = 'error'
-         ORDER BY embedding_updated_at DESC
-         LIMIT 5",
-    )?;
-    let err_rows = err_stmt.query_map([], |row| {
-        Ok(json!({
-            "document_id": row.get::<_, i64>(0)?,
-            "kind": row.get::<_, Option<String>>(1)?,
-            "error": row.get::<_, Option<String>>(2)?,
-            "updated_at": row.get::<_, Option<String>>(3)?
-        }))
-    })?;
-    let recent_errors: Vec<Value> = err_rows.filter_map(|r| r.ok()).collect();
-
-    let out = json!({
-        "summary": {
-            "reference_count": reference_count,
-            "document_count": document_count
-        },
-        "references": refs,
-        "embedding_counts": embedding_counts,
-        "recent_errors": recent_errors
-    });
-
-    Ok(serde_json::to_string_pretty(&out)?)
-}
-
-fn tool_sync_zotero(state: Arc<AppState>) -> Result<String> {
+/// Perform Zotero sync using the provided connection (used by both init and tool)
+fn sync_zotero_impl(conn: &mut Connection) -> Result<String> {
     let reader = ZoteroReader::new()?;
     let items = reader.get_items()?;
 
-    let mut conn = state.conn.lock().unwrap();
     let tx = conn.transaction()?;
 
     let mut existing_map = std::collections::HashMap::new();
@@ -794,12 +452,514 @@ fn tool_sync_zotero(state: Arc<AppState>) -> Result<String> {
 
     tx.commit()?;
 
-    let _ = state.worker_tx.send(WorkerSignal::Wake);
-
     Ok(format!(
         "Zotero sync complete. References added: {}, updated: {}. Documents upserted: {}. Document files upserted: {}.",
         refs_added, refs_updated, docs_upserted, files_upserted
     ))
+}
+
+fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+
+    // Initialize LitLake paths (creates directories as needed)
+    let paths = LitLakePaths::init()?;
+    let db_path = paths.db.to_string_lossy().to_string();
+    let models_path = paths.models.clone();
+
+    eprintln!("[main] Using database: {}", db_path);
+    eprintln!("[main] Using models directory: {:?}", models_path);
+
+    // Register sqlite-vec extension once per process.
+    unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    }
+
+    // Open main connection and init DB (this is fast)
+    let conn = Connection::open(&db_path)?;
+    init_db(&conn)?;
+
+    // Create app state with init status
+    let app_state = Arc::new(AppState {
+        conn: Arc::new(Mutex::new(conn)),
+        worker_tx: Arc::new(Mutex::new(None)),
+        init_status: Arc::new(Mutex::new(InitStatus::SyncingZotero)),
+    });
+
+    // Spawn background initialization thread
+    {
+        let state = app_state.clone();
+        let db_path = db_path.clone();
+        let models_path = models_path.clone();
+
+        thread::spawn(move || {
+            if let Err(e) = background_init(state, db_path, models_path) {
+                eprintln!("[init] Background initialization failed: {:?}", e);
+            }
+        });
+    }
+
+    eprintln!("[main] Server ready. Waiting for messages...");
+
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    while let Some(line) = lines.next() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let req: JsonRpcRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Failed to parse JSON: {}", e);
+                continue;
+            }
+        };
+
+        eprintln!("Received: {} ({:?})", req.method, req.id);
+
+        let response = match req.method.as_str() {
+            "initialize" => handle_initialize(&req),
+            "notifications/initialized" => None,
+            "tools/list" => handle_list_tools(&req),
+            "tools/call" => handle_call_tool(&req, app_state.clone()),
+            _ => handle_unknown(&req),
+        };
+
+        if let Some(resp) = response {
+            let json_str = serde_json::to_string(&resp)?;
+            let mut stdout = io::stdout();
+            stdout.write_all(json_str.as_bytes())?;
+            stdout.write_all(b"\n")?;
+            stdout.flush()?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Background initialization: sync Zotero, load models, start worker
+fn background_init(state: Arc<AppState>, db_path: String, models_path: PathBuf) -> Result<()> {
+    // Step 1: Sync Zotero (DB is ready, this works immediately)
+    eprintln!("[init] Syncing Zotero library...");
+    {
+        *state.init_status.lock().unwrap() = InitStatus::SyncingZotero;
+    }
+    
+    // Open a separate connection for the sync (to avoid blocking main thread)
+    {
+        let mut sync_conn = Connection::open(&db_path)?;
+        init_db(&sync_conn)?;
+        match sync_zotero_impl(&mut sync_conn) {
+            Ok(msg) => eprintln!("[init] {}", msg),
+            Err(e) => eprintln!("[init] Zotero sync failed (continuing anyway): {:?}", e),
+        }
+    }
+
+    // Step 2: Load embedding model
+    eprintln!("[init] Loading embedding model...");
+    {
+        *state.init_status.lock().unwrap() = InitStatus::LoadingEmbeddingModel;
+    }
+    
+    let embedder = match TextEmbedding::try_new(
+        InitOptions::new(EmbeddingModel::BGESmallENV15)
+            .with_cache_dir(models_path.clone())
+            .with_show_download_progress(true),
+    ) {
+        Ok(e) => Arc::new(Mutex::new(e)),
+        Err(e) => {
+            let msg = format!("Failed to load embedding model: {:?}", e);
+            eprintln!("[init] {}", msg);
+            *state.init_status.lock().unwrap() = InitStatus::Failed(msg);
+            return Err(e.into());
+        }
+    };
+
+    // Step 3: Load reranker model
+    eprintln!("[init] Loading reranker model...");
+    {
+        *state.init_status.lock().unwrap() = InitStatus::LoadingRerankerModel;
+    }
+    
+    let reranker = match TextRerank::try_new(
+        RerankInitOptions::new(RerankerModel::BGERerankerBase)
+            .with_cache_dir(models_path.clone())
+            .with_show_download_progress(true),
+    ) {
+        Ok(r) => Arc::new(Mutex::new(r)),
+        Err(e) => {
+            let msg = format!("Failed to load reranker model: {:?}", e);
+            eprintln!("[init] {}", msg);
+            *state.init_status.lock().unwrap() = InitStatus::Failed(msg);
+            return Err(e.into());
+        }
+    };
+
+    // Step 4: Register AI functions on the main connection
+    eprintln!("[init] Registering AI functions...");
+    {
+        let conn = state.conn.lock().unwrap();
+        register_ai_functions(&conn, embedder.clone(), reranker.clone())?;
+    }
+
+    // Step 5: Start embedding worker
+    eprintln!("[init] Starting embedding worker...");
+    {
+        *state.init_status.lock().unwrap() = InitStatus::StartingWorker;
+    }
+    
+    let (worker_tx, worker_rx) = mpsc::channel::<WorkerSignal>();
+    {
+        let cfg = WorkerConfig {
+            db_path: db_path.clone(),
+            models_path: models_path.clone(),
+            ..Default::default()
+        };
+        thread::spawn(move || {
+            let worker = EmbeddingWorker::new(cfg, worker_rx);
+            if let Err(e) = worker.run() {
+                eprintln!("[embeddings] Worker exited with error: {:?}", e);
+            }
+        });
+    }
+
+    // Store worker_tx in state
+    {
+        *state.worker_tx.lock().unwrap() = Some(worker_tx.clone());
+    }
+
+    // Wake worker to process any pending embeddings from the sync
+    let _ = worker_tx.send(WorkerSignal::Wake);
+
+    // Step 6: Mark as ready
+    eprintln!("[init] Initialization complete. Ready for queries.");
+    {
+        *state.init_status.lock().unwrap() = InitStatus::Ready;
+    }
+
+    Ok(())
+}
+
+fn handle_initialize(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    Some(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: req.id.clone(),
+        error: None,
+        result: Some(json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "lit-lake-mcp", "version": "0.1.0" }
+        })),
+    })
+}
+
+fn handle_list_tools(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    Some(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: req.id.clone(),
+        error: None,
+        result: Some(json!({
+            "tools": [
+                {
+                    "name": "sync_zotero",
+                    "description": "Import/update references from Zotero into the local library. Creates title and abstract documents for each reference, which are then embedded asynchronously for semantic search. Call this first if the library seems empty or out of date.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    },
+                    "annotations": {
+                        "title": "Sync Zotero Library",
+                        "readOnlyHint": false,
+                        "destructiveHint": false
+                    }
+                },
+                {
+                    "name": "sql_search",
+                    "description": r#"Query the research library with full SQL flexibility. Supports semantic search via embed() and rerank_score() scalar functions.
+
+**First time?** Call get_documentation with section='workflows' to understand typical workflows for this tool before writing queries.
+
+## Quick Reference
+
+embed(text) → BLOB: Compute embedding for semantic similarity.
+rerank_score(query, doc) → REAL: Cross-encoder relevance score.
+
+```sql
+SELECT r.title, r.authors, r.year, d.content,
+       rerank_score('your question', d.content) AS relevance
+FROM vec_documents v
+JOIN documents d ON v.rowid = d.id
+JOIN reference_items r ON d.reference_id = r.id
+WHERE v.embedding MATCH embed('your question')
+  AND k = 30 AND d.embedding_status = 'ready'
+ORDER BY relevance DESC LIMIT 10;
+```
+
+Start broad, then refine. Don't over-specify on first attempt."#,
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "A read-only SQL query. Use embed() for vector search and rerank_score() for relevance ordering." }
+                        },
+                        "required": ["query"]
+                    },
+                    "annotations": {
+                        "title": "Search Library with SQL",
+                        "readOnlyHint": true,
+                        "destructiveHint": false
+                    }
+                },
+                {
+                    "name": "get_documentation",
+                    "description": "Get detailed documentation including supported workflows, SQL examples, and database schema. Call with section='workflows' for step-by-step guidance on citation assistance and library research. Sections: 'workflows', 'schema', 'examples', or omit for overview.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "section": {
+                                "type": "string",
+                                "description": "Section to retrieve: 'workflows' (recommended first read), 'schema', 'examples', or omit for overview."
+                            }
+                        }
+                    },
+                    "annotations": {
+                        "title": "Get Documentation",
+                        "readOnlyHint": true,
+                        "destructiveHint": false
+                    }
+                },
+                {
+                    "name": "library_status",
+                    "description": "Get an overview of the library: how many references exist, what document types are available per reference, and embedding status. Use this to understand library scope before crafting queries, or to check if embeddings are ready after a sync.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    },
+                    "annotations": {
+                        "title": "Get Library Status",
+                        "readOnlyHint": true,
+                        "destructiveHint": false
+                    }
+                },
+                {
+                    "name": "preview_document_pdf_pages",
+                    "description": "Render PNG images of PDF pages to visually inspect full-text content. Use this to validate claims, check methodology, or verify specific details that aren't in the abstract. Requires document_file_id from the document_files table.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "document_file_id": { "type": "integer", "description": "The document_files.id for the PDF to preview." },
+                            "size": { "type": "integer", "description": "Max dimension in pixels (64-4096). Default 1024." },
+                            "start_page": { "type": "integer", "description": "First page to render (1-based). Default 1." },
+                            "end_page": { "type": "integer", "description": "Last page to render (1-based). Default = start_page. Max 10 pages per call." }
+                        },
+                        "required": ["document_file_id"]
+                    },
+                    "annotations": {
+                        "title": "Preview PDF Pages",
+                        "readOnlyHint": true,
+                        "destructiveHint": false
+                    }
+                }
+            ]
+        })),
+    })
+}
+
+fn handle_call_tool(req: &JsonRpcRequest, state: Arc<AppState>) -> Option<JsonRpcResponse> {
+    let params = req.params.as_ref()?;
+    let name = params.get("name").and_then(|n| n.as_str())?;
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    let result: Result<Value> = match name {
+        "sync_zotero" => tool_sync_zotero(state).map(text_tool_result),
+        "sql_search" => tool_sql_search(state, args).map(text_tool_result),
+        "get_documentation" => tool_get_documentation(args).map(text_tool_result),
+        "library_status" => tool_library_status(state).map(text_tool_result),
+        "preview_document_pdf_pages" => tool_preview_document_pdf_pages(state, args),
+        _ => Err(anyhow::anyhow!("Tool not found")),
+    };
+
+    match result {
+        Ok(content) => Some(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id.clone(),
+            error: None,
+            result: Some(content),
+        }),
+        Err(e) => Some(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id.clone(),
+            error: None,
+            result: Some(json!({
+                "isError": true,
+                "content": [{ "type": "text", "text": format!("Error: {}", e) }]
+            })),
+        }),
+    }
+}
+
+fn tool_library_status(state: Arc<AppState>) -> Result<String> {
+    let conn = state.conn.lock().unwrap();
+
+    // Get init status
+    let init_status = state.init_status.lock().unwrap();
+    let init_status_json = json!({
+        "ready": init_status.is_ready(),
+        "message": init_status.message()
+    });
+    drop(init_status);
+
+    let reference_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM reference_items", [], |row| row.get(0))?;
+    let document_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT
+            r.id,
+            r.title,
+            r.authors,
+            r.year,
+            r.source_system,
+            r.source_id,
+            d.id,
+            d.kind,
+            d.embedding_status,
+            d.updated_at
+         FROM reference_items r
+         LEFT JOIN documents d ON d.reference_id = r.id
+         ORDER BY r.updated_at DESC, r.id DESC, d.kind ASC, d.id ASC",
+    )?;
+
+    #[derive(Debug)]
+    struct Row {
+        reference_id: i64,
+        title: Option<String>,
+        authors: Option<String>,
+        year: Option<String>,
+        source_system: String,
+        source_id: String,
+        document_id: Option<i64>,
+        kind: Option<String>,
+        embedding_status: Option<String>,
+        updated_at: Option<String>,
+    }
+
+    let rows = stmt.query_map([], |row| {
+        Ok(Row {
+            reference_id: row.get(0)?,
+            title: row.get(1)?,
+            authors: row.get(2)?,
+            year: row.get(3)?,
+            source_system: row.get(4)?,
+            source_id: row.get(5)?,
+            document_id: row.get(6)?,
+            kind: row.get(7)?,
+            embedding_status: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    })?;
+
+    let mut refs: Vec<Value> = Vec::new();
+    let mut current_ref_id: Option<i64> = None;
+    let mut current_ref: Option<serde_json::Map<String, Value>> = None;
+    let mut current_docs: Vec<Value> = Vec::new();
+
+    for r in rows {
+        let r = r?;
+        if current_ref_id != Some(r.reference_id) {
+            if let Some(mut cr) = current_ref.take() {
+                cr.insert("documents".to_string(), json!(current_docs));
+                refs.push(Value::Object(cr));
+                current_docs = Vec::new();
+            }
+            current_ref_id = Some(r.reference_id);
+            let mut m = serde_json::Map::new();
+            m.insert("reference_id".to_string(), json!(r.reference_id));
+            m.insert("title".to_string(), json!(r.title));
+            m.insert("authors".to_string(), json!(r.authors));
+            m.insert("year".to_string(), json!(r.year));
+            m.insert("source_system".to_string(), json!(r.source_system));
+            m.insert("source_id".to_string(), json!(r.source_id));
+            current_ref = Some(m);
+        }
+        if let Some(doc_id) = r.document_id {
+            current_docs.push(json!({
+                "document_id": doc_id,
+                "kind": r.kind,
+                "embedding_status": r.embedding_status,
+                "updated_at": r.updated_at,
+            }));
+        }
+    }
+    if let Some(mut cr) = current_ref.take() {
+        cr.insert("documents".to_string(), json!(current_docs));
+        refs.push(Value::Object(cr));
+    }
+
+    // Embedding counts
+    let mut count_stmt = conn.prepare(
+        "SELECT kind, embedding_status, COUNT(*) as count
+         FROM documents
+         GROUP BY kind, embedding_status
+         ORDER BY kind, embedding_status",
+    )?;
+    let count_rows = count_stmt.query_map([], |row| {
+        Ok(json!({
+            "kind": row.get::<_, Option<String>>(0)?,
+            "embedding_status": row.get::<_, Option<String>>(1)?,
+            "count": row.get::<_, i64>(2)?
+        }))
+    })?;
+    let embedding_counts: Vec<Value> = count_rows.filter_map(|r| r.ok()).collect();
+
+    // Recent errors
+    let mut err_stmt = conn.prepare(
+        "SELECT id, kind, embedding_error, embedding_updated_at
+         FROM documents
+         WHERE embedding_status = 'error'
+         ORDER BY embedding_updated_at DESC
+         LIMIT 5",
+    )?;
+    let err_rows = err_stmt.query_map([], |row| {
+        Ok(json!({
+            "document_id": row.get::<_, i64>(0)?,
+            "kind": row.get::<_, Option<String>>(1)?,
+            "error": row.get::<_, Option<String>>(2)?,
+            "updated_at": row.get::<_, Option<String>>(3)?
+        }))
+    })?;
+    let recent_errors: Vec<Value> = err_rows.filter_map(|r| r.ok()).collect();
+
+    let out = json!({
+        "init_status": init_status_json,
+        "summary": {
+            "reference_count": reference_count,
+            "document_count": document_count
+        },
+        "references": refs,
+        "embedding_counts": embedding_counts,
+        "recent_errors": recent_errors
+    });
+
+    Ok(serde_json::to_string_pretty(&out)?)
+}
+
+fn tool_sync_zotero(state: Arc<AppState>) -> Result<String> {
+    let mut conn = state.conn.lock().unwrap();
+    let result = sync_zotero_impl(&mut conn)?;
+    
+    // Wake worker if available
+    if let Some(tx) = state.worker_tx.lock().unwrap().as_ref() {
+        let _ = tx.send(WorkerSignal::Wake);
+    }
+    
+    Ok(result)
 }
 
 fn tool_get_documentation(args: Value) -> Result<String> {
@@ -1081,10 +1241,11 @@ LIMIT 20;
 Lit Lake connects your Zotero library to AI-powered semantic search. It syncs your references, generates embeddings for titles and abstracts, and lets you query with natural language via SQL.
 
 ## Quick Start
-1. Call `sync_zotero` to import your library
-2. Wait a moment for embeddings to be generated (check with `library_status`)
+1. **On first launch**, Lit Lake automatically syncs your Zotero library and downloads AI models (~500MB, one-time)
+2. Check `library_status` to see initialization progress — look for `init_status.ready: true`
 3. Use `sql_search` with embed() and rerank_score() to find relevant papers
 4. Use `preview_document_pdf_pages` to visually inspect full PDFs when needed
+5. Call `sync_zotero` manually if you've added new references to Zotero
 
 ## Tools Summary
 
@@ -1125,6 +1286,23 @@ ORDER BY rerank_score('your query', d.content) DESC
 }
 
 fn tool_sql_search(state: Arc<AppState>, args: Value) -> Result<String> {
+    // Check if models are ready
+    {
+        let status = state.init_status.lock().unwrap();
+        if !status.is_ready() {
+            if status.is_failed() {
+                return Err(anyhow::anyhow!(
+                    "AI models failed to load: {}. Semantic search is unavailable.",
+                    status.message()
+                ));
+            }
+            return Ok(format!(
+                "AI models are still loading ({}). Please try again in a moment.",
+                status.message()
+            ));
+        }
+    }
+
     let query = args["query"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing query"))?;

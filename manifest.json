@@ -1,10 +1,11 @@
 {
   "manifest_version": "0.2",
   "name": "lit-lake",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "description": "A MCP to connect your reference managers to Claude",
   "author": {
-    "name": "Elliot Roe"
+    "name": "Elliot Roe",
+    "url": "https://github.com/ElliotRoe"
   },
   "server": {
     "type": "binary",
