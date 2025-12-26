@@ -1,5 +1,7 @@
 mod db;
+mod docling;
 mod embeddings;
+mod extraction;
 mod preview;
 mod zotero;
 
@@ -19,7 +21,9 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::db::init_db;
+use crate::docling::{download_model as download_docling_model, DoclingProcessor};
 use crate::embeddings::{EmbeddingWorker, WorkerConfig, WorkerSignal};
+use crate::extraction::{ExtractionConfig, ExtractionSignal, ExtractionWorker};
 use crate::zotero::ZoteroReader;
 
 /// Initialization status for async startup
@@ -28,6 +32,7 @@ enum InitStatus {
     SyncingZotero,
     LoadingEmbeddingModel,
     LoadingRerankerModel,
+    LoadingDoclingModel,
     StartingWorker,
     Ready,
     Failed(String),
@@ -39,7 +44,8 @@ impl InitStatus {
             InitStatus::SyncingZotero => "Syncing Zotero library...",
             InitStatus::LoadingEmbeddingModel => "Loading embedding model (may download on first run)...",
             InitStatus::LoadingRerankerModel => "Loading reranker model (may download on first run)...",
-            InitStatus::StartingWorker => "Starting embedding worker...",
+            InitStatus::LoadingDoclingModel => "Loading Docling model for PDF OCR (may download ~500MB on first run)...",
+            InitStatus::StartingWorker => "Starting workers...",
             InitStatus::Ready => "Ready",
             InitStatus::Failed(msg) => msg,
         }
@@ -211,6 +217,7 @@ struct JsonRpcResponse {
 struct AppState {
     conn: Arc<Mutex<Connection>>,
     worker_tx: Arc<Mutex<Option<mpsc::Sender<WorkerSignal>>>>,
+    extraction_tx: Arc<Mutex<Option<mpsc::Sender<ExtractionSignal>>>>,
     init_status: Arc<Mutex<InitStatus>>,
 }
 
@@ -484,6 +491,7 @@ fn main() -> Result<()> {
     let app_state = Arc::new(AppState {
         conn: Arc::new(Mutex::new(conn)),
         worker_tx: Arc::new(Mutex::new(None)),
+        extraction_tx: Arc::new(Mutex::new(None)),
         init_status: Arc::new(Mutex::new(InitStatus::SyncingZotero)),
     });
 
@@ -606,12 +614,35 @@ fn background_init(state: Arc<AppState>, db_path: String, models_path: PathBuf) 
         register_ai_functions(&conn, embedder.clone(), reranker.clone())?;
     }
 
-    // Step 5: Start embedding worker
-    eprintln!("[init] Starting embedding worker...");
+    // Step 5: Load Docling model for PDF OCR
+    eprintln!("[init] Loading Docling model...");
+    {
+        *state.init_status.lock().unwrap() = InitStatus::LoadingDoclingModel;
+    }
+    
+    let docling_processor = match download_docling_model(&models_path) {
+        Ok((model_path, tokenizer_path)) => {
+            match DoclingProcessor::new(&model_path, &tokenizer_path) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("[init] Failed to load Docling model (PDF OCR disabled): {:?}", e);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[init] Failed to download Docling model (PDF OCR disabled): {:?}", e);
+            None
+        }
+    };
+
+    // Step 6: Start workers
+    eprintln!("[init] Starting workers...");
     {
         *state.init_status.lock().unwrap() = InitStatus::StartingWorker;
     }
     
+    // Start embedding worker
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerSignal>();
     {
         let cfg = WorkerConfig {
@@ -632,10 +663,36 @@ fn background_init(state: Arc<AppState>, db_path: String, models_path: PathBuf) 
         *state.worker_tx.lock().unwrap() = Some(worker_tx.clone());
     }
 
-    // Wake worker to process any pending embeddings from the sync
+    // Start extraction worker if Docling model loaded successfully
+    let (extraction_tx, extraction_rx) = mpsc::channel::<ExtractionSignal>();
+    if let Some(processor) = docling_processor {
+        let cfg = ExtractionConfig {
+            db_path: db_path.clone(),
+            models_path: models_path.clone(),
+            ..Default::default()
+        };
+        thread::spawn(move || {
+            let worker = ExtractionWorker::new(cfg, extraction_rx);
+            if let Err(e) = worker.run(processor) {
+                eprintln!("[extraction] Worker exited with error: {:?}", e);
+            }
+        });
+        
+        // Store extraction_tx in state
+        {
+            *state.extraction_tx.lock().unwrap() = Some(extraction_tx.clone());
+        }
+        
+        // Wake extraction worker to process any pending PDFs
+        let _ = extraction_tx.send(ExtractionSignal::Wake);
+    } else {
+        eprintln!("[init] Extraction worker not started (Docling model unavailable)");
+    }
+
+    // Wake embedding worker to process any pending embeddings from the sync
     let _ = worker_tx.send(WorkerSignal::Wake);
 
-    // Step 6: Mark as ready
+    // Step 7: Mark as ready
     eprintln!("[init] Initialization complete. Ready for queries.");
     {
         *state.init_status.lock().unwrap() = InitStatus::Ready;
@@ -954,9 +1011,14 @@ fn tool_sync_zotero(state: Arc<AppState>) -> Result<String> {
     let mut conn = state.conn.lock().unwrap();
     let result = sync_zotero_impl(&mut conn)?;
     
-    // Wake worker if available
+    // Wake embedding worker if available
     if let Some(tx) = state.worker_tx.lock().unwrap().as_ref() {
         let _ = tx.send(WorkerSignal::Wake);
+    }
+    
+    // Wake extraction worker to process new PDFs
+    if let Some(tx) = state.extraction_tx.lock().unwrap().as_ref() {
+        let _ = tx.send(ExtractionSignal::Wake);
     }
     
     Ok(result)

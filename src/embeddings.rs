@@ -92,7 +92,7 @@ impl EmbeddingWorker {
                 "SELECT id, content
                  FROM documents
                  WHERE embedding_status = 'pending'
-                   AND kind IN ('title', 'abstract')
+                   AND kind IN ('title', 'abstract', 'pdf_chunk')
                    AND content IS NOT NULL
                    AND TRIM(content) <> ''
                  ORDER BY updated_at ASC

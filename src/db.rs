@@ -40,8 +40,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             reference_id INTEGER,
+            document_file_id INTEGER,
             kind TEXT NOT NULL,
             content TEXT,
+            chunk_index INTEGER,
             embedding_status TEXT DEFAULT 'pending',
             embedding_updated_at DATETIME,
             embedding_error TEXT,
@@ -49,7 +51,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             source_id TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(reference_id) REFERENCES reference_items(id) ON DELETE CASCADE
+            FOREIGN KEY(reference_id) REFERENCES reference_items(id) ON DELETE CASCADE,
+            FOREIGN KEY(document_file_id) REFERENCES document_files(id) ON DELETE CASCADE
         )",
         [],
     )?;
@@ -61,6 +64,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             file_path TEXT NOT NULL,
             mime_type TEXT,
             label TEXT,
+            extracted_text TEXT,
+            extraction_status TEXT DEFAULT 'pending',
+            extraction_error TEXT,
             source_system TEXT,
             source_id TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -82,6 +88,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_reference_external_ids_scheme_value ON reference_external_ids(scheme, value)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_files_extraction_status ON document_files(extraction_status)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_documents_document_file_id ON documents(document_file_id)",
         [],
     )?;
 
