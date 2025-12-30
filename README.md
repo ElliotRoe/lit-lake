@@ -35,13 +35,25 @@ On first launch, Lit Lake will:
 
 You can check progress by asking Claude to call `library_status`. Once `init_status` shows "Ready", semantic search is available.
 
+#### PDF Full-Text Extraction (Optional)
+To enable full-text extraction from PDF attachments, set the `GEMINI_API_KEY` environment variable with a valid [Google AI Studio](https://aistudio.google.com/) API key.
+
+When enabled, Lit Lake will:
+1. **Automatically extract text** from PDF attachments using Gemini's vision capabilities
+2. **Store the full text** in the database for direct access
+3. **Create searchable chunks** that are embedded for semantic search within full papers
+
+You can check extraction progress via `library_status` — look for the `extraction` status counts. Without the API key, PDFs will remain unextracted but you can still search titles and abstracts.
+
 ### Other LLMs
 To use Lit Lake with other LLM clients (like LM Studio, Cherry studio, etc), you'll just need to download the binary file and make it executable then configure it globally. Honestly, I haven't configured it yet with another client, if you are attempting, please reach out and I can help, then I'll add the instructions back here.
 ## Use Cases
+
 #### Paper Discovery & Search 
-The search ability is great for discovering individual or groups of papers based on a topic. For every paper, depending on what is available in Zotero, Claude can search for keywords and search semantically within the titles and abstracts of your references. Notably, due to how I've implemented this tool, Claude also has the ability to combine these to two types of search in arbitrary and programatic ways, for more on this, see the advanced example.
+The search ability is great for discovering individual or groups of papers based on a topic. Claude can search for keywords and search semantically within the titles, abstracts, and full-text content of your references. Due to how this tool is implemented, Claude can combine these search types in arbitrary and programmatic ways.
 
 *Examples*
+
 **Keyword Search** 
 > "Can you find all articles in my library that have the keyword 'pedagogical content knowledge' or 'PCK' within their abstract?"
 
@@ -50,6 +62,23 @@ The search ability is great for discovering individual or groups of papers based
 
 **Advanced Search** 
 > "Find me all articles that have keywords 'pedagogical content knowledge' or 'PCK' within their abstract and are related to out of field teaching or teaching self-efficacy."
+
+#### Full-Text Analysis
+With PDF extraction enabled, Claude can access and analyze the complete content of your papers — not just titles and abstracts. This is invaluable for verification, deep research, and finding specific passages.
+
+*Examples*
+
+**Find Specific Passages**
+> "What does Smith 2023 say about their methodology for data collection?"
+
+**Search Full Text Across Library**
+> "Find passages in my library that discuss the limitations of self-report measures."
+
+**Verify Claims**
+> "I'm citing Johnson 2022 for the claim that teacher efficacy affects student outcomes. Can you find the specific passage that supports this?"
+
+**Visual Inspection**
+> "Show me the figures from Chapter 3 of the Williams dissertation."
 ### The Thesis
 Hey! Glad you made it this far down in the `README.md` :) I know this is a lot of text, but for the folks that care, here's the "why" behind this tool. My thesis on the state of AI tools right now and where I'd like this to go. 
 
