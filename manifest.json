@@ -37,7 +37,7 @@
       "type": "string",
       "title": "Gemini API Key",
       "description": "Your Gemini API key to power extraction agents. If not provided, extraction features are disabled",
-      "required": false,
+      "required": true,
       "sensitive": true
     }
   },
