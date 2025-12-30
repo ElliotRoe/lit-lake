@@ -1,5 +1,7 @@
 mod db;
 mod embeddings;
+mod extraction;
+mod gemini;
 mod preview;
 mod zotero;
 
@@ -20,6 +22,7 @@ use std::thread;
 
 use crate::db::init_db;
 use crate::embeddings::{EmbeddingWorker, WorkerConfig, WorkerSignal};
+use crate::extraction::{ExtractionConfig, ExtractionSignal, ExtractionWorker, GeminiExtractor, NoopExtractor};
 use crate::zotero::ZoteroReader;
 
 /// Initialization status for async startup
@@ -28,7 +31,8 @@ enum InitStatus {
     SyncingZotero,
     LoadingEmbeddingModel,
     LoadingRerankerModel,
-    StartingWorker,
+    StartingEmbeddingWorker,
+    StartingExtractionWorker,
     Ready,
     Failed(String),
 }
@@ -39,7 +43,8 @@ impl InitStatus {
             InitStatus::SyncingZotero => "Syncing Zotero library...",
             InitStatus::LoadingEmbeddingModel => "Loading embedding model (may download on first run)...",
             InitStatus::LoadingRerankerModel => "Loading reranker model (may download on first run)...",
-            InitStatus::StartingWorker => "Starting embedding worker...",
+            InitStatus::StartingEmbeddingWorker => "Starting embedding worker...",
+            InitStatus::StartingExtractionWorker => "Starting extraction worker...",
             InitStatus::Ready => "Ready",
             InitStatus::Failed(msg) => msg,
         }
@@ -210,7 +215,8 @@ struct JsonRpcResponse {
 
 struct AppState {
     conn: Arc<Mutex<Connection>>,
-    worker_tx: Arc<Mutex<Option<mpsc::Sender<WorkerSignal>>>>,
+    embedding_tx: Arc<Mutex<Option<mpsc::Sender<WorkerSignal>>>>,
+    extraction_tx: Arc<Mutex<Option<mpsc::Sender<ExtractionSignal>>>>,
     init_status: Arc<Mutex<InitStatus>>,
 }
 
@@ -415,36 +421,17 @@ fn sync_zotero_impl(conn: &mut Connection) -> Result<String> {
             docs_upserted += 1;
         }
 
-        // PDF document
+        // PDF file (linked directly to reference, chunks created by extraction worker)
         if let Some(pdf_path) = &item.pdf_path {
-            let document_id: i64 = match tx.query_row(
-                "SELECT id FROM documents
-                 WHERE reference_id = ? AND kind = 'full_text_pdf' AND source_system = 'zotero' AND source_id = ?
-                 LIMIT 1",
-                (reference_id, &item.key),
-                |row| row.get::<_, i64>(0),
-            ) {
-                Ok(id) => id,
-                Err(_) => {
-                    tx.execute(
-                        "INSERT INTO documents (reference_id, kind, content, embedding_status, source_system, source_id)
-                         VALUES (?, 'full_text_pdf', NULL, 'skipped', 'zotero', ?)",
-                        (reference_id, &item.key),
-                    )?;
-                    docs_upserted += 1;
-                    tx.last_insert_rowid()
-                }
-            };
-
             tx.execute(
-                "INSERT INTO document_files (document_id, file_path, mime_type, label, source_system, source_id)
+                "INSERT INTO document_files (reference_id, file_path, mime_type, label, source_system, source_id)
                  VALUES (?, ?, 'application/pdf', 'main_pdf', 'zotero', ?)
-                 ON CONFLICT(document_id, file_path) DO UPDATE SET
+                 ON CONFLICT(reference_id, file_path) DO UPDATE SET
                     mime_type=excluded.mime_type,
                     label=excluded.label,
                     source_system=excluded.source_system,
                     source_id=excluded.source_id",
-                (document_id, pdf_path, &item.key),
+                (reference_id, pdf_path, &item.key),
             )?;
             files_upserted += 1;
         }
@@ -483,7 +470,8 @@ fn main() -> Result<()> {
     // Create app state with init status
     let app_state = Arc::new(AppState {
         conn: Arc::new(Mutex::new(conn)),
-        worker_tx: Arc::new(Mutex::new(None)),
+        embedding_tx: Arc::new(Mutex::new(None)),
+        extraction_tx: Arc::new(Mutex::new(None)),
         init_status: Arc::new(Mutex::new(InitStatus::SyncingZotero)),
     });
 
@@ -609,10 +597,10 @@ fn background_init(state: Arc<AppState>, db_path: String, models_path: PathBuf) 
     // Step 5: Start embedding worker
     eprintln!("[init] Starting embedding worker...");
     {
-        *state.init_status.lock().unwrap() = InitStatus::StartingWorker;
+        *state.init_status.lock().unwrap() = InitStatus::StartingEmbeddingWorker;
     }
     
-    let (worker_tx, worker_rx) = mpsc::channel::<WorkerSignal>();
+    let (embedding_tx, embedding_rx) = mpsc::channel::<WorkerSignal>();
     {
         let cfg = WorkerConfig {
             db_path: db_path.clone(),
@@ -620,22 +608,64 @@ fn background_init(state: Arc<AppState>, db_path: String, models_path: PathBuf) 
             ..Default::default()
         };
         thread::spawn(move || {
-            let worker = EmbeddingWorker::new(cfg, worker_rx);
+            let worker = EmbeddingWorker::new(cfg, embedding_rx);
             if let Err(e) = worker.run() {
                 eprintln!("[embeddings] Worker exited with error: {:?}", e);
             }
         });
     }
 
-    // Store worker_tx in state
+    // Store embedding_tx in state
     {
-        *state.worker_tx.lock().unwrap() = Some(worker_tx.clone());
+        *state.embedding_tx.lock().unwrap() = Some(embedding_tx.clone());
     }
 
-    // Wake worker to process any pending embeddings from the sync
-    let _ = worker_tx.send(WorkerSignal::Wake);
+    // Wake embedding worker to process any pending embeddings from the sync
+    let _ = embedding_tx.send(WorkerSignal::Wake);
 
-    // Step 6: Mark as ready
+    // Step 6: Start extraction worker
+    eprintln!("[init] Starting extraction worker...");
+    {
+        *state.init_status.lock().unwrap() = InitStatus::StartingExtractionWorker;
+    }
+
+    let (extraction_tx, extraction_rx) = mpsc::channel::<ExtractionSignal>();
+    {
+        let cfg = ExtractionConfig {
+            db_path: db_path.clone(),
+            ..Default::default()
+        };
+        
+        // Use GeminiExtractor if API key is set, otherwise fall back to NoopExtractor
+        if let Ok(extractor) = GeminiExtractor::from_env_with_concurrency(cfg.concurrency) {
+            eprintln!("[init] Using Gemini extractor for PDF processing (concurrency: {})", cfg.concurrency);
+            thread::spawn(move || {
+                let worker = ExtractionWorker::new(cfg, extraction_rx, extractor);
+                if let Err(e) = worker.run() {
+                    eprintln!("[extraction] Worker exited with error: {:?}", e);
+                }
+            });
+        } else {
+            eprintln!("[init] GEMINI_API_KEY not set, using noop extractor (PDFs won't be processed)");
+            let extractor = NoopExtractor::new();
+            thread::spawn(move || {
+                let worker = ExtractionWorker::new(cfg, extraction_rx, extractor);
+                if let Err(e) = worker.run() {
+                    eprintln!("[extraction] Worker exited with error: {:?}", e);
+                }
+            });
+        }
+    }
+
+    // Store extraction_tx in state
+    {
+        *state.extraction_tx.lock().unwrap() = Some(extraction_tx.clone());
+    }
+
+    // Wake extraction worker to process any pending PDFs
+    let _ = extraction_tx.send(ExtractionSignal::Wake);
+
+    // Step 7: Mark as ready
     eprintln!("[init] Initialization complete. Ready for queries.");
     {
         *state.init_status.lock().unwrap() = InitStatus::Ready;
@@ -666,7 +696,7 @@ fn handle_list_tools(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
             "tools": [
                 {
                     "name": "sync_zotero",
-                    "description": "Import/update references from Zotero into the local library. Creates title and abstract documents for each reference, which are then embedded asynchronously for semantic search. Call this first if the library seems empty or out of date.",
+                    "description": "Import/update references from Zotero into the local library. Creates title and abstract documents for each reference, which are embedded asynchronously for semantic search. Also queues PDF attachments for full-text extraction (requires GEMINI_API_KEY). Call this first if the library seems empty or out of date.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -680,9 +710,9 @@ fn handle_list_tools(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
                 },
                 {
                     "name": "sql_search",
-                    "description": r#"Query the research library with full SQL flexibility. Supports semantic search via embed() and rerank_score() scalar functions.
+                    "description": r#"**IMPORTANT**: Before your first query, call get_documentation with section='workflows' to understand the data model, search patterns, and full-text access methods.
 
-**First time?** Call get_documentation with section='workflows' to understand typical workflows for this tool before writing queries.
+Query the research library with full SQL flexibility. Supports semantic search via embed() and rerank_score() scalar functions.
 
 ## Quick Reference
 
@@ -734,7 +764,7 @@ Start broad, then refine. Don't over-specify on first attempt."#,
                 },
                 {
                     "name": "library_status",
-                    "description": "Get an overview of the library: how many references exist, what document types are available per reference, and embedding status. Use this to understand library scope before crafting queries, or to check if embeddings are ready after a sync.",
+                    "description": "Get an overview of the library: reference counts, document types, embedding status, and PDF extraction status. Use this to understand library scope, check if embeddings are ready after a sync, or monitor PDF full-text extraction progress.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -748,7 +778,7 @@ Start broad, then refine. Don't over-specify on first attempt."#,
                 },
                 {
                     "name": "preview_document_pdf_pages",
-                    "description": "Render PNG images of PDF pages to visually inspect full-text content. Use this to validate claims, check methodology, or verify specific details that aren't in the abstract. Requires document_file_id from the document_files table.",
+                    "description": "Render PNG images of PDF pages for VISUAL inspection (figures, tables, layout). For programmatic text access, use document_files.extracted_text or query pdf_chunk documents instead. Requires document_file_id from the document_files table.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -814,137 +844,111 @@ fn tool_library_status(state: Arc<AppState>) -> Result<String> {
     });
     drop(init_status);
 
+    // Summary counts
     let reference_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM reference_items", [], |row| row.get(0))?;
     let document_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
+    let pdf_file_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_files WHERE mime_type = 'application/pdf'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
-    let mut stmt = conn.prepare(
-        "SELECT
-            r.id,
-            r.title,
-            r.authors,
-            r.year,
-            r.source_system,
-            r.source_id,
-            d.id,
-            d.kind,
-            d.embedding_status,
-            d.updated_at
-         FROM reference_items r
-         LEFT JOIN documents d ON d.reference_id = r.id
-         ORDER BY r.updated_at DESC, r.id DESC, d.kind ASC, d.id ASC",
-    )?;
-
-    #[derive(Debug)]
-    struct Row {
-        reference_id: i64,
-        title: Option<String>,
-        authors: Option<String>,
-        year: Option<String>,
-        source_system: String,
-        source_id: String,
-        document_id: Option<i64>,
-        kind: Option<String>,
-        embedding_status: Option<String>,
-        updated_at: Option<String>,
-    }
-
-    let rows = stmt.query_map([], |row| {
-        Ok(Row {
-            reference_id: row.get(0)?,
-            title: row.get(1)?,
-            authors: row.get(2)?,
-            year: row.get(3)?,
-            source_system: row.get(4)?,
-            source_id: row.get(5)?,
-            document_id: row.get(6)?,
-            kind: row.get(7)?,
-            embedding_status: row.get(8)?,
-            updated_at: row.get(9)?,
-        })
-    })?;
-
-    let mut refs: Vec<Value> = Vec::new();
-    let mut current_ref_id: Option<i64> = None;
-    let mut current_ref: Option<serde_json::Map<String, Value>> = None;
-    let mut current_docs: Vec<Value> = Vec::new();
-
-    for r in rows {
-        let r = r?;
-        if current_ref_id != Some(r.reference_id) {
-            if let Some(mut cr) = current_ref.take() {
-                cr.insert("documents".to_string(), json!(current_docs));
-                refs.push(Value::Object(cr));
-                current_docs = Vec::new();
-            }
-            current_ref_id = Some(r.reference_id);
-            let mut m = serde_json::Map::new();
-            m.insert("reference_id".to_string(), json!(r.reference_id));
-            m.insert("title".to_string(), json!(r.title));
-            m.insert("authors".to_string(), json!(r.authors));
-            m.insert("year".to_string(), json!(r.year));
-            m.insert("source_system".to_string(), json!(r.source_system));
-            m.insert("source_id".to_string(), json!(r.source_id));
-            current_ref = Some(m);
-        }
-        if let Some(doc_id) = r.document_id {
-            current_docs.push(json!({
-                "document_id": doc_id,
-                "kind": r.kind,
-                "embedding_status": r.embedding_status,
-                "updated_at": r.updated_at,
-            }));
-        }
-    }
-    if let Some(mut cr) = current_ref.take() {
-        cr.insert("documents".to_string(), json!(current_docs));
-        refs.push(Value::Object(cr));
-    }
-
-    // Embedding counts
-    let mut count_stmt = conn.prepare(
+    // Embedding status by kind: { "pdf": { "ready": 5, "pending": 2 }, "abstract": { ... } }
+    let mut embed_stmt = conn.prepare(
         "SELECT kind, embedding_status, COUNT(*) as count
          FROM documents
-         GROUP BY kind, embedding_status
-         ORDER BY kind, embedding_status",
+         GROUP BY kind, embedding_status",
     )?;
-    let count_rows = count_stmt.query_map([], |row| {
-        Ok(json!({
-            "kind": row.get::<_, Option<String>>(0)?,
-            "embedding_status": row.get::<_, Option<String>>(1)?,
-            "count": row.get::<_, i64>(2)?
-        }))
+    let embed_rows = embed_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
     })?;
-    let embedding_counts: Vec<Value> = count_rows.filter_map(|r| r.ok()).collect();
 
-    // Recent errors
-    let mut err_stmt = conn.prepare(
-        "SELECT id, kind, embedding_error, embedding_updated_at
+    let mut embedding: serde_json::Map<String, Value> = serde_json::Map::new();
+    for row in embed_rows {
+        let (kind, status, count) = row?;
+        let kind_key = kind.unwrap_or_else(|| "unknown".to_string());
+        let status_key = status.unwrap_or_else(|| "null".to_string());
+
+        let kind_obj = embedding
+            .entry(kind_key)
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .unwrap();
+        kind_obj.insert(status_key, json!(count));
+    }
+
+    // Extraction status: { "ready": 10, "pending": 5, ... }
+    let mut extract_stmt = conn.prepare(
+        "SELECT extraction_status, COUNT(*) as count
+         FROM document_files
+         WHERE mime_type = 'application/pdf'
+         GROUP BY extraction_status",
+    )?;
+    let extract_rows = extract_stmt.query_map([], |row| {
+        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+    })?;
+
+    let mut extraction: serde_json::Map<String, Value> = serde_json::Map::new();
+    for row in extract_rows {
+        let (status, count) = row?;
+        let status_key = status.unwrap_or_else(|| "null".to_string());
+        extraction.insert(status_key, json!(count));
+    }
+
+    // Recent embedding errors (limit 5)
+    let mut embed_err_stmt = conn.prepare(
+        "SELECT id, kind, embedding_error
          FROM documents
          WHERE embedding_status = 'error'
          ORDER BY embedding_updated_at DESC
          LIMIT 5",
     )?;
-    let err_rows = err_stmt.query_map([], |row| {
+    let embed_err_rows = embed_err_stmt.query_map([], |row| {
         Ok(json!({
-            "document_id": row.get::<_, i64>(0)?,
+            "doc_id": row.get::<_, i64>(0)?,
             "kind": row.get::<_, Option<String>>(1)?,
-            "error": row.get::<_, Option<String>>(2)?,
-            "updated_at": row.get::<_, Option<String>>(3)?
+            "error": row.get::<_, Option<String>>(2)?
         }))
     })?;
-    let recent_errors: Vec<Value> = err_rows.filter_map(|r| r.ok()).collect();
+    let embedding_errors: Vec<Value> = embed_err_rows.filter_map(|r| r.ok()).collect();
+
+    // Recent extraction errors (limit 5)
+    let mut extract_err_stmt = conn.prepare(
+        "SELECT df.id, df.extraction_error
+         FROM document_files df
+         WHERE df.extraction_status = 'error'
+         ORDER BY df.id DESC
+         LIMIT 5",
+    )?;
+    let extract_err_rows = extract_err_stmt.query_map([], |row| {
+        Ok(json!({
+            "file_id": row.get::<_, i64>(0)?,
+            "error": row.get::<_, Option<String>>(1)?
+        }))
+    })?;
+    let extraction_errors: Vec<Value> = extract_err_rows.filter_map(|r| r.ok()).collect();
 
     let out = json!({
         "init_status": init_status_json,
         "summary": {
-            "reference_count": reference_count,
-            "document_count": document_count
+            "references": reference_count,
+            "documents": document_count,
+            "pdf_files": pdf_file_count
         },
-        "references": refs,
-        "embedding_counts": embedding_counts,
-        "recent_errors": recent_errors
+        "embedding": embedding,
+        "extraction": extraction,
+        "errors": {
+            "embedding": embedding_errors,
+            "extraction": extraction_errors
+        }
     });
 
     Ok(serde_json::to_string_pretty(&out)?)
@@ -954,9 +958,14 @@ fn tool_sync_zotero(state: Arc<AppState>) -> Result<String> {
     let mut conn = state.conn.lock().unwrap();
     let result = sync_zotero_impl(&mut conn)?;
     
-    // Wake worker if available
-    if let Some(tx) = state.worker_tx.lock().unwrap().as_ref() {
+    // Wake embedding worker if available
+    if let Some(tx) = state.embedding_tx.lock().unwrap().as_ref() {
         let _ = tx.send(WorkerSignal::Wake);
+    }
+    
+    // Wake extraction worker if available (for new PDFs)
+    if let Some(tx) = state.extraction_tx.lock().unwrap().as_ref() {
+        let _ = tx.send(ExtractionSignal::Wake);
     }
     
     Ok(result)
@@ -985,21 +994,33 @@ JOIN documents d ON v.rowid = d.id
 JOIN reference_items r ON d.reference_id = r.id
 WHERE v.embedding MATCH embed('your claim or question')
   AND k = 30 AND d.embedding_status = 'ready'
-  AND d.kind IN ('title', 'abstract')
+  AND d.kind = 'abstract'
 ORDER BY relevance DESC LIMIT 10;
 ```
 
 **Steps**:
 1. If input is a paragraph with multiple claims, break it into separate searchable statements
-2. For each claim/question, run a semantic search (embed + rerank)
-3. Add hard filters as needed: year range, author patterns, document kind
+2. For each claim/question, run a semantic search on abstracts (embed + rerank)
+3. Add hard filters as needed: year range, author patterns
 4. Review abstracts to assess relevance
-5. For deeper validation (methodology, data), use preview_document_pdf_pages
+5. Once you've identified relevant papers, dive into their full text if needed:
+   ```sql
+   SELECT d.chunk_index, d.content,
+          rerank_score('your specific question', d.content) AS relevance
+   FROM vec_documents v
+   JOIN documents d ON v.rowid = d.id
+   WHERE v.embedding MATCH embed('your specific question')
+     AND k = 20 AND d.embedding_status = 'ready'
+     AND d.reference_id IN (<reference_ids from step 4>)
+     AND d.kind = 'pdf_chunk'
+   ORDER BY relevance DESC LIMIT 10;
+   ```
 
 **Tips**:
 - Different claims need different searches — don't try to find one paper that covers everything
 - Start with k=30, increase if results seem incomplete
 - Use rerank_score() in ORDER BY for better relevance than raw vector distance
+- Search abstracts first to find papers, then search pdf_chunks within those papers for specific passages
 
 ---
 
@@ -1020,21 +1041,25 @@ ORDER BY relevance DESC LIMIT 10;
      AND r.year = '2023';
    ```
 3. Read the abstract to assess whether it genuinely supports the claim
-4. For rigorous QA, find the PDF and visually inspect relevant sections:
+4. If abstract is insufficient, search for the specific passage in the full text:
    ```sql
-   SELECT df.id AS document_file_id, df.file_path
-   FROM reference_items r
-   JOIN documents d ON d.reference_id = r.id AND d.kind = 'full_text_pdf'
-   JOIN document_files df ON df.document_id = d.id
-   WHERE r.id = <reference_id>;
+   SELECT d.chunk_index, d.content,
+          rerank_score('the specific claim you are verifying', d.content) AS relevance
+   FROM vec_documents v
+   JOIN documents d ON v.rowid = d.id
+   WHERE v.embedding MATCH embed('the specific claim you are verifying')
+     AND k = 20 AND d.embedding_status = 'ready'
+     AND d.reference_id = <reference_id>
+     AND d.kind = 'pdf_chunk'
+   ORDER BY relevance DESC LIMIT 3;
    ```
-   Then call preview_document_pdf_pages with that document_file_id.
 5. Flag citations that don't adequately support their claims
 
-**When to do rigorous PDF review**:
-- High-stakes documents (publications, grants)
-- Claims about specific data, numbers, or methodology
-- Citations that seem tangentially related based on abstract
+**When to use visual preview (preview_document_pdf_pages)**:
+- Complex mathematical formulas or equations that may not render correctly as text
+- Figures, charts, or diagrams referenced in the claim
+- Tables with specific data points
+- When the extracted text seems garbled or incomplete
 
 ---
 
@@ -1045,7 +1070,7 @@ ORDER BY relevance DESC LIMIT 10;
 **CRITICAL PRINCIPLE**: Start broad, then narrow. Don't over-specify on first attempt.
 
 **Steps**:
-1. Start with a broad semantic query, no hard filters, large k:
+1. Start with a broad semantic query on abstracts, no hard filters, large k:
    ```sql
    SELECT r.title, r.authors, r.year, d.content
    FROM vec_documents v
@@ -1053,6 +1078,7 @@ ORDER BY relevance DESC LIMIT 10;
    JOIN reference_items r ON d.reference_id = r.id
    WHERE v.embedding MATCH embed('your broad topic')
      AND k = 50 AND d.embedding_status = 'ready'
+     AND d.kind = 'abstract'
    ORDER BY v.distance LIMIT 20;
    ```
 2. Observe patterns in results: common terminology, author names, year ranges, themes
@@ -1061,9 +1087,11 @@ ORDER BY relevance DESC LIMIT 10;
    - Add author patterns if key researchers emerge
    - Refine the semantic query using vocabulary from relevant abstracts
 4. Use rerank_score() once you've narrowed to a reasonable candidate set
-5. Final query might look very different from first query
+5. Once you have a focused set of papers (5-15), search their full text for specific aspects:
+   - Use pdf_chunk search constrained to those reference_ids
+   - Or retrieve extracted_text for comprehensive reading (see schema section)
 
-**Why this matters**: A hyper-specific first query may return nothing, missing papers that use different terminology for the same concepts.
+**Why this matters**: Abstract search finds the right papers; full-text search finds the right passages within those papers. Don't skip straight to full-text — you'll get overwhelmed by chunks from irrelevant papers.
 
 ---
 
@@ -1081,10 +1109,13 @@ ORDER BY relevance DESC LIMIT 10;
    - Soft: rerank_score() for relevance
    - Apply hard filters in WHERE, soft in ORDER BY
 
-4. **Document kinds**:
-   - 'title': Short, good for quick relevance
-   - 'abstract': Detailed, best for substantive matching
-   - 'full_text_pdf': Content is NULL, but PDF is available via preview_document_pdf_pages
+4. **Document kinds** — IMPORTANT: Query ONE kind at a time. Mixing kinds creates noisy results.
+
+   **'abstract'** (recommended default): Best for finding a collection of relevant papers. Use when asking "What studies discuss X?" or "Find papers related to Y." Abstracts are curated summaries that represent the paper's core contribution.
+
+   **'title'**: Very broad, quick scan. Use for initial exploration when you're not sure what terms to search, or to quickly see what might be in the library on a topic.
+
+   **'pdf_chunk'**: Full-text search. Use ONLY after narrowing to a smaller pool of references. Risk: one highly relevant paper can have many matching chunks that drown out other papers. Best for: "Where in these specific papers do they discuss X?" or "Find the exact passage about Y in Smith 2023."
 "#
         }
         Some("schema") => {
@@ -1104,13 +1135,15 @@ Canonical citeable references imported from Zotero.
 Text artifacts linked to references. Each reference typically has:
 - A 'title' document (embedded)
 - An 'abstract' document (embedded)
-- Optionally a 'full_text_pdf' document (not embedded, but PDF available)
+- Multiple 'pdf_chunk' documents (from extracted PDF text, linked via document_file_id)
 
 Key columns:
 - `id`: Primary key (also used as rowid in vec_documents)
 - `reference_id`: FK to reference_items
-- `kind`: 'title', 'abstract', or 'full_text_pdf'
-- `content`: The actual text (NULL for file-backed docs)
+- `kind`: 'title', 'abstract', or 'pdf_chunk'
+- `document_file_id`: FK to document_files (for pdf_chunk documents)
+- `chunk_index`: Position of chunk in original document (for ordering pdf_chunks)
+- `content`: The actual text
 - `embedding_status`: 'pending', 'embedding', 'ready', 'error', 'skipped'
 
 ### vec_documents
@@ -1120,11 +1153,13 @@ sqlite-vec virtual table for vector similarity search.
 - Query with: `WHERE embedding MATCH embed('query') AND k = N`
 
 ### document_files
-File attachments (PDFs) linked to documents.
+File attachments (PDFs) linked to references. Text is extracted automatically by the Gemini extraction worker.
 - `id`: Primary key (use this for preview_document_pdf_pages)
-- `document_id`: FK to documents
+- `reference_id`: FK to reference_items
 - `file_path`: Absolute path to the file
 - `mime_type`: Usually 'application/pdf'
+- `extracted_text`: Full extracted PDF text (NULL until extraction completes)
+- `extraction_status`: 'pending', 'extracting', 'ready', 'error'
 
 ### reference_external_ids
 Additional identifiers per reference (DOI, ISBN, Zotero key, etc.).
@@ -1141,13 +1176,67 @@ FROM reference_items r
 LEFT JOIN documents d ON d.reference_id = r.id;
 ```
 
-Document with its PDF file:
+Reference with its PDF files:
 ```sql
-SELECT d.*, df.id as file_id, df.file_path
-FROM documents d
-JOIN document_files df ON df.document_id = d.id
-WHERE d.kind = 'full_text_pdf';
+SELECT r.id, r.title, df.id as file_id, df.file_path, df.extraction_status
+FROM reference_items r
+JOIN document_files df ON df.reference_id = r.id
+WHERE df.mime_type = 'application/pdf';
 ```
+
+Get all chunks for a reference in reading order:
+```sql
+SELECT d.chunk_index, d.content
+FROM documents d
+WHERE d.reference_id = <reference_id>
+  AND d.kind = 'pdf_chunk'
+ORDER BY d.chunk_index;
+```
+
+## Accessing Full Text
+
+PDF extraction (requires GEMINI_API_KEY) automatically processes attached PDFs:
+1. Full text is stored in `document_files.extracted_text`
+2. Text is split into ~512-token chunks stored as `pdf_chunk` documents
+3. Each chunk gets embedded for semantic search
+
+**Get entire extracted text** (for summarizing or comprehensive reading):
+```sql
+SELECT r.title, df.extracted_text
+FROM reference_items r
+JOIN document_files df ON df.reference_id = r.id
+WHERE r.id = <reference_id>
+  AND df.extraction_status = 'ready';
+```
+
+**Keyword search within a paper**:
+```sql
+SELECT d.chunk_index, d.content
+FROM documents d
+WHERE d.reference_id = <reference_id>
+  AND d.kind = 'pdf_chunk'
+  AND d.content LIKE '%your keyword%'
+ORDER BY d.chunk_index;
+```
+
+**Semantic search within a paper** (find most relevant passage):
+```sql
+SELECT d.chunk_index, d.content,
+       rerank_score('your question', d.content) AS relevance
+FROM vec_documents v
+JOIN documents d ON v.rowid = d.id
+WHERE v.embedding MATCH embed('your question')
+  AND k = 20 AND d.embedding_status = 'ready'
+  AND d.reference_id = <reference_id>
+  AND d.kind = 'pdf_chunk'
+ORDER BY relevance DESC LIMIT 5;
+```
+
+**When to use visual preview instead** (`preview_document_pdf_pages`):
+- Complex mathematical formulas or equations
+- Figures, charts, or diagrams
+- Tables with precise formatting
+- When extracted text appears garbled
 "#
         }
         Some("examples") => {
@@ -1155,21 +1244,23 @@ WHERE d.kind = 'full_text_pdf';
 # SQL Examples
 
 ## Basic Semantic Search (start here)
+Search abstracts to find relevant papers on a topic:
 ```sql
-SELECT r.title, r.authors, r.year, d.kind, d.content
+SELECT r.title, r.authors, r.year, d.content
 FROM vec_documents v
 JOIN documents d ON v.rowid = d.id
 JOIN reference_items r ON d.reference_id = r.id
 WHERE v.embedding MATCH embed('your search topic')
   AND k = 30
   AND d.embedding_status = 'ready'
+  AND d.kind = 'abstract'
 ORDER BY v.distance
 LIMIT 15;
 ```
 
 ## Semantic Search with Reranking (better relevance)
 ```sql
-SELECT r.title, r.authors, r.year, d.kind, d.content,
+SELECT r.title, r.authors, r.year, d.content,
        rerank_score('your specific question', d.content) AS relevance
 FROM vec_documents v
 JOIN documents d ON v.rowid = d.id
@@ -1177,7 +1268,7 @@ JOIN reference_items r ON d.reference_id = r.id
 WHERE v.embedding MATCH embed('your specific question')
   AND k = 40
   AND d.embedding_status = 'ready'
-  AND d.kind IN ('title', 'abstract')
+  AND d.kind = 'abstract'
 ORDER BY relevance DESC
 LIMIT 10;
 ```
@@ -1201,10 +1292,9 @@ LIMIT 10;
 
 ## Find PDFs for Full-Text Preview
 ```sql
-SELECT r.title, df.id AS document_file_id, df.file_path
+SELECT r.title, df.id AS document_file_id, df.file_path, df.extraction_status
 FROM reference_items r
-JOIN documents d ON d.reference_id = r.id AND d.kind = 'full_text_pdf'
-JOIN document_files df ON df.document_id = d.id
+JOIN document_files df ON df.reference_id = r.id
 WHERE df.mime_type = 'application/pdf'
 LIMIT 20;
 ```
@@ -1231,6 +1321,49 @@ WHERE v.embedding MATCH embed('machine learning')
 ORDER BY v.distance
 LIMIT 20;
 ```
+
+## Get Full Extracted Text for a Reference
+```sql
+SELECT r.title, df.extracted_text
+FROM reference_items r
+JOIN document_files df ON df.reference_id = r.id
+WHERE r.id = <reference_id>
+  AND df.extraction_status = 'ready';
+```
+
+## Keyword Search Within a Single Paper
+```sql
+SELECT d.chunk_index, d.content
+FROM documents d
+WHERE d.reference_id = <reference_id>
+  AND d.kind = 'pdf_chunk'
+  AND d.content LIKE '%methodology%'
+ORDER BY d.chunk_index;
+```
+
+## Semantic Search Within One Paper's Chunks
+```sql
+SELECT d.chunk_index, d.content,
+       rerank_score('what statistical methods were used', d.content) AS relevance
+FROM vec_documents v
+JOIN documents d ON v.rowid = d.id
+WHERE v.embedding MATCH embed('what statistical methods were used')
+  AND k = 20
+  AND d.embedding_status = 'ready'
+  AND d.reference_id = <reference_id>
+  AND d.kind = 'pdf_chunk'
+ORDER BY relevance DESC
+LIMIT 5;
+```
+
+## Check Extraction Status
+```sql
+SELECT r.title, df.extraction_status, df.extraction_error
+FROM reference_items r
+JOIN document_files df ON df.reference_id = r.id
+WHERE df.mime_type = 'application/pdf'
+ORDER BY df.extraction_status;
+```
 "#
         }
         _ => {
@@ -1238,23 +1371,30 @@ LIMIT 20;
 # Lit Lake MCP Documentation
 
 ## What This Server Does
-Lit Lake connects your Zotero library to AI-powered semantic search. It syncs your references, generates embeddings for titles and abstracts, and lets you query with natural language via SQL.
+Lit Lake connects your Zotero library to AI-powered semantic search. It syncs your references, generates embeddings for titles and abstracts, extracts full text from PDFs, and lets you query with natural language via SQL.
 
 ## Quick Start
 1. **On first launch**, Lit Lake automatically syncs your Zotero library and downloads AI models (~500MB, one-time)
 2. Check `library_status` to see initialization progress — look for `init_status.ready: true`
 3. Use `sql_search` with embed() and rerank_score() to find relevant papers
-4. Use `preview_document_pdf_pages` to visually inspect full PDFs when needed
-5. Call `sync_zotero` manually if you've added new references to Zotero
+4. Access full-text via `extracted_text` column or search within `pdf_chunk` documents
+5. Use `preview_document_pdf_pages` to visually inspect figures/tables in PDFs
+6. Call `sync_zotero` manually if you've added new references to Zotero
+
+## PDF Extraction
+If `GEMINI_API_KEY` is set, Lit Lake automatically extracts text from PDF attachments in the background:
+- Full text is stored in `document_files.extracted_text`
+- Text is chunked into searchable `pdf_chunk` documents with embeddings
+- Check progress via `library_status` or query `document_files.extraction_status`
 
 ## Tools Summary
 
 | Tool | Purpose |
 |------|---------|
-| sync_zotero | Import/update references from Zotero |
+| sync_zotero | Import/update references and queue PDFs for extraction |
 | sql_search | Query with SQL + semantic search functions |
-| library_status | Check library scope and embedding readiness |
-| preview_document_pdf_pages | Visual PDF inspection for validation |
+| library_status | Check library scope, embeddings, and extraction progress |
+| preview_document_pdf_pages | Visual PDF inspection (figures, tables, layout) |
 | get_documentation | This documentation |
 
 ## Key Concepts
@@ -1269,7 +1409,7 @@ WHERE v.embedding MATCH embed('your query') AND k = 30
 ORDER BY rerank_score('your query', d.content) DESC
 ```
 
-**Document kinds**: 'title' (short), 'abstract' (detailed), 'full_text_pdf' (file only)
+**Document kinds**: 'title' (short), 'abstract' (detailed), 'pdf_chunk' (extracted PDF chunks)
 
 ## Recommended Reading Order
 1. `get_documentation` with section='workflows' — understand how to use the tools together
