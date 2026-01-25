@@ -28,6 +28,8 @@ If you've moved your Zotero data directory or use a custom location, set this to
 - **macOS/Linux**: `/Users/yourname/Custom/Zotero/zotero.sqlite`
 - **Windows**: `C:\Users\yourname\Zotero\zotero.sqlite`
 
+You can also optionally set a **Lit Lake Folder**. This is the parent folder where the `LitLake` data directory will be created. If you select a folder that is not named `LitLake`, the app will create `LitLake` inside it. If left blank, Lit Lake uses `~/LitLake`.
+
 #### First Run
 On first launch, Lit Lake will:
 1. **Automatically sync your Zotero library** — no manual action needed
@@ -35,15 +37,18 @@ On first launch, Lit Lake will:
 
 You can check progress by asking Claude to call `library_status`. Once `init_status` shows "Ready", semantic search is available.
 
-#### PDF Full-Text Extraction (Optional)
-To enable full-text extraction from PDF attachments, set the `GEMINI_API_KEY` environment variable with a valid [Google AI Studio](https://aistudio.google.com/) API key.
+#### PDF Full-Text Extraction
+Lit Lake extracts PDF text locally by default using the `extract-pdf` crate (pure Rust, no external system dependencies). This keeps the MCP shippable as a static binary.
 
-When enabled, Lit Lake will:
-1. **Automatically extract text** from PDF attachments using Gemini's vision capabilities
-2. **Store the full text** in the database for direct access
-3. **Create searchable chunks** that are embedded for semantic search within full papers
+If you set `GEMINI_API_KEY` (from [Google AI Studio](https://aistudio.google.com/)), Lit Lake will use Gemini instead, which often yields cleaner, more structured markdown.
 
-You can check extraction progress via `library_status` — look for the `extraction` status counts. Without the API key, PDFs will remain unextracted but you can still search titles and abstracts.
+When extraction runs, Lit Lake will:
+1. **Automatically extract text** from PDF attachments (local by default, Gemini if configured)
+2. **Lightly normalize raw text** (fix line wraps and hyphenation) to improve chunking
+3. **Store the full text** in the database for direct access
+4. **Create searchable chunks** that are embedded for semantic search within full papers
+
+You can check extraction progress via `library_status` — look for the `extraction` status counts.
 
 ### Other LLMs
 To use Lit Lake with other LLM clients (like LM Studio, Cherry studio, etc), you'll just need to download the binary file and make it executable then configure it globally. Honestly, I haven't configured it yet with another client, if you are attempting, please reach out and I can help, then I'll add the instructions back here.

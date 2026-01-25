@@ -18,3 +18,4 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3.31"
+pdf_extract = { package = "pdf-extract", version = "0.10.0" }

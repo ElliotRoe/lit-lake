@@ -22,7 +22,9 @@ use std::thread;
 
 use crate::db::init_db;
 use crate::embeddings::{EmbeddingWorker, WorkerConfig, WorkerSignal};
-use crate::extraction::{ExtractionConfig, ExtractionSignal, ExtractionWorker, GeminiExtractor, NoopExtractor};
+use crate::extraction::{
+    ExtractPdfExtractor, ExtractionConfig, ExtractionSignal, ExtractionWorker, GeminiExtractor,
+};
 use crate::zotero::ZoteroReader;
 
 /// Initialization status for async startup
@@ -72,15 +74,36 @@ struct LitLakePaths {
 
 impl LitLakePaths {
     /// Initialize LitLake paths, creating directories as needed.
-    /// Priority: LIT_LAKE_DIR env var, otherwise ~/LitLake
+    /// Priority: LIT_LAKE_PATH (if set), otherwise ~/LitLake
     fn init() -> Result<Self> {
-        let root = if let Ok(dir) = env::var("LIT_LAKE_DIR") {
-            PathBuf::from(dir)
-        } else if let Some(home) = dirs::home_dir() {
-            home.join("LitLake")
+        let root = if let Ok(path) = env::var("LIT_LAKE_PATH") {
+            let mut path = path.trim().to_string();
+            // Remove templating if the user didn't set it to anything
+            if let (Some(start), Some(end)) = (path.find("${"), path.find("}")) {
+                if start < end {
+                    path = format!("{}{}", &path[..start], &path[end + 1..]);
+                }
+            }
+            if !path.is_empty() {
+                let base_dir = PathBuf::from(&path);
+                let is_litlake = base_dir
+                    .file_name()
+                    .map(|name| name == "LitLake")
+                    .unwrap_or(false);
+                if is_litlake {
+                    base_dir
+                } else {
+                    base_dir.join("LitLake")
+                }
+            } else {
+                dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+                    .join("LitLake")
+            }
         } else {
-            // Fallback to current directory
-            PathBuf::from(".")
+            dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+                .join("LitLake")
         };
 
         // Create root directory if it doesn't exist
@@ -594,34 +617,42 @@ fn background_init(state: Arc<AppState>, db_path: String, models_path: PathBuf) 
         register_ai_functions(&conn, embedder.clone(), reranker.clone())?;
     }
 
-    // Step 5: Start embedding worker
-    eprintln!("[init] Starting embedding worker...");
-    {
-        *state.init_status.lock().unwrap() = InitStatus::StartingEmbeddingWorker;
-    }
-    
-    let (embedding_tx, embedding_rx) = mpsc::channel::<WorkerSignal>();
-    {
-        let cfg = WorkerConfig {
-            db_path: db_path.clone(),
-            models_path: models_path.clone(),
-            ..Default::default()
-        };
-        thread::spawn(move || {
-            let worker = EmbeddingWorker::new(cfg, embedding_rx);
-            if let Err(e) = worker.run() {
-                eprintln!("[embeddings] Worker exited with error: {:?}", e);
-            }
-        });
-    }
+    // Step 5: Start embedding worker (unless disabled via EMBED_DISABLED)
+    let embed_disabled = env::var("EMBED_DISABLED")
+        .map(|v| !v.contains("${") && (v == "true" || v == "1"))
+        .unwrap_or(false);
 
-    // Store embedding_tx in state
-    {
-        *state.embedding_tx.lock().unwrap() = Some(embedding_tx.clone());
-    }
+    if embed_disabled {
+        eprintln!("[init] Embedding worker disabled via EMBED_DISABLED");
+    } else {
+        eprintln!("[init] Starting embedding worker...");
+        {
+            *state.init_status.lock().unwrap() = InitStatus::StartingEmbeddingWorker;
+        }
+        
+        let (embedding_tx, embedding_rx) = mpsc::channel::<WorkerSignal>();
+        {
+            let cfg = WorkerConfig {
+                db_path: db_path.clone(),
+                models_path: models_path.clone(),
+                ..Default::default()
+            };
+            thread::spawn(move || {
+                let worker = EmbeddingWorker::new(cfg, embedding_rx);
+                if let Err(e) = worker.run() {
+                    eprintln!("[embeddings] Worker exited with error: {:?}", e);
+                }
+            });
+        }
 
-    // Wake embedding worker to process any pending embeddings from the sync
-    let _ = embedding_tx.send(WorkerSignal::Wake);
+        // Store embedding_tx in state
+        {
+            *state.embedding_tx.lock().unwrap() = Some(embedding_tx.clone());
+        }
+
+        // Wake embedding worker to process any pending embeddings from the sync
+        let _ = embedding_tx.send(WorkerSignal::Wake);
+    }
 
     // Step 6: Start extraction worker
     eprintln!("[init] Starting extraction worker...");
@@ -636,9 +667,12 @@ fn background_init(state: Arc<AppState>, db_path: String, models_path: PathBuf) 
             ..Default::default()
         };
         
-        // Use GeminiExtractor if API key is set, otherwise fall back to NoopExtractor
+        // Use GeminiExtractor if API key is set, otherwise default to extract-pdf (local).
         if let Ok(extractor) = GeminiExtractor::from_env_with_concurrency(cfg.concurrency) {
-            eprintln!("[init] Using Gemini extractor for PDF processing (concurrency: {})", cfg.concurrency);
+            eprintln!(
+                "[init] Using Gemini extractor for PDF processing (concurrency: {})",
+                cfg.concurrency
+            );
             thread::spawn(move || {
                 let worker = ExtractionWorker::new(cfg, extraction_rx, extractor);
                 if let Err(e) = worker.run() {
@@ -646,8 +680,8 @@ fn background_init(state: Arc<AppState>, db_path: String, models_path: PathBuf) 
                 }
             });
         } else {
-            eprintln!("[init] GEMINI_API_KEY not set, using noop extractor (PDFs won't be processed)");
-            let extractor = NoopExtractor::new();
+            eprintln!("[init] GEMINI_API_KEY not set, using extract-pdf (local) for PDF processing");
+            let extractor = ExtractPdfExtractor::new();
             thread::spawn(move || {
                 let worker = ExtractionWorker::new(cfg, extraction_rx, extractor);
                 if let Err(e) = worker.run() {
@@ -696,7 +730,7 @@ fn handle_list_tools(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
             "tools": [
                 {
                     "name": "sync_zotero",
-                    "description": "Import/update references from Zotero into the local library. Creates title and abstract documents for each reference, which are embedded asynchronously for semantic search. Also queues PDF attachments for full-text extraction (requires GEMINI_API_KEY). Call this first if the library seems empty or out of date.",
+                    "description": "Import/update references from Zotero into the local library. Creates title and abstract documents for each reference, which are embedded asynchronously for semantic search. Also queues PDF attachments for full-text extraction (local extract-pdf by default; Gemini if GEMINI_API_KEY is set). Call this first if the library seems empty or out of date.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -1153,7 +1187,7 @@ sqlite-vec virtual table for vector similarity search.
 - Query with: `WHERE embedding MATCH embed('query') AND k = N`
 
 ### document_files
-File attachments (PDFs) linked to references. Text is extracted automatically by the Gemini extraction worker.
+File attachments (PDFs) linked to references. Text is extracted automatically by the PDF extraction worker (local extract-pdf by default; Gemini if configured).
 - `id`: Primary key (use this for preview_document_pdf_pages)
 - `reference_id`: FK to reference_items
 - `file_path`: Absolute path to the file
@@ -1195,7 +1229,7 @@ ORDER BY d.chunk_index;
 
 ## Accessing Full Text
 
-PDF extraction (requires GEMINI_API_KEY) automatically processes attached PDFs:
+PDF extraction (local by default; Gemini if GEMINI_API_KEY is set) automatically processes attached PDFs:
 1. Full text is stored in `document_files.extracted_text`
 2. Text is split into ~512-token chunks stored as `pdf_chunk` documents
 3. Each chunk gets embedded for semantic search
@@ -1382,7 +1416,7 @@ Lit Lake connects your Zotero library to AI-powered semantic search. It syncs yo
 6. Call `sync_zotero` manually if you've added new references to Zotero
 
 ## PDF Extraction
-If `GEMINI_API_KEY` is set, Lit Lake automatically extracts text from PDF attachments in the background:
+Lit Lake automatically extracts text from PDF attachments in the background (local extract-pdf by default; Gemini if `GEMINI_API_KEY` is set):
 - Full text is stored in `document_files.extracted_text`
 - Text is chunked into searchable `pdf_chunk` documents with embeddings
 - Check progress via `library_status` or query `document_files.extraction_status`

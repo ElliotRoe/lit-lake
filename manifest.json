@@ -14,8 +14,9 @@
       "command": "${__dirname}/lit-lake-mcp",
       "args": [],
       "env": {
+        "EMBED_DISABLED": "${user_config.disable_embedding}",
         "ZOTERO_DB_PATH": "${user_config.z_db}",
-        "DB_PATH": "${HOME}/lit_lake.db",
+        "LIT_LAKE_PATH": "${user_config.lit_lake_folder}",
         "GEMINI_API_KEY": "${user_config.gemini_api_key}"
       },
       "platform_overrides": {
@@ -26,6 +27,13 @@
     }
   },
   "user_config": {
+    "disable_embedding": {
+      "type": "boolean",
+      "title": "Disable Embedding",
+      "description": "Used to disable the embedding background processes for Lit Lake. Useful to enable when battery life is a concern",
+      "required": false,
+      "sensitive": false
+    },
     "z_db": {
       "type": "file",
       "title": "Zotero DB",
@@ -33,11 +41,18 @@
       "required": false,
       "sensitive": false
     },
+    "lit_lake_folder": {
+      "type": "directory",
+      "title": "Lit Lake Folder",
+      "description": "The parent folder in which the 'LitLake' data folder should be created within (Optional: defaults to ~/LitLake)",
+      "required": false,
+      "sensitive": false
+    },
     "gemini_api_key": {
       "type": "string",
       "title": "Gemini API Key",
-      "description": "Your Gemini API key to power extraction agents. If not provided, extraction features are disabled",
-      "required": true,
+      "description": "Optional. If set, PDFs are extracted with Gemini. Otherwise Lit Lake uses local extract-pdf.",
+      "required": false,
       "sensitive": true
     }
   },

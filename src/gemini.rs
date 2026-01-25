@@ -68,8 +68,10 @@ pub struct GeminiConfig {
 
 impl GeminiConfig {
     pub fn from_env() -> Result<Self> {
-        let api_key =
-            std::env::var("GEMINI_API_KEY").context("GEMINI_API_KEY environment variable not set")?;
+        let api_key = std::env::var("GEMINI_API_KEY")
+            .ok()
+            .filter(|v| !v.contains("${"))
+            .ok_or_else(|| anyhow::anyhow!("GEMINI_API_KEY environment variable not set"))?;
 
         Ok(Self {
             api_key,

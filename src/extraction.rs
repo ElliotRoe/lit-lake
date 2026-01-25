@@ -43,15 +43,15 @@
 //! }
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
+use std::{fs, sync::Arc};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use crate::gemini::{GeminiClient, GeminiConfig, GeminiModel};
-use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 // ============================================================================
@@ -166,6 +166,38 @@ impl PdfExtractor for NoopExtractor {
     fn extract(&self, _pdf_path: &Path) -> Result<String> {
         // Should never be called since is_enabled() returns false
         Err(anyhow::anyhow!("NoopExtractor cannot extract PDFs"))
+    }
+}
+
+// ============================================================================
+// extract-pdf Extractor (local, pure Rust)
+// ============================================================================
+
+/// PDF extractor using the `pdf-extract` crate (local, no external services).
+pub struct ExtractPdfExtractor;
+
+impl ExtractPdfExtractor {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ExtractPdfExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PdfExtractor for ExtractPdfExtractor {
+    fn name(&self) -> &str {
+        "extract-pdf"
+    }
+
+    fn extract(&self, pdf_path: &Path) -> Result<String> {
+        let bytes = fs::read(pdf_path)
+            .with_context(|| format!("Failed to read PDF bytes from {}", pdf_path.display()))?;
+        pdf_extract::extract_text_from_mem(&bytes)
+            .with_context(|| format!("pdf-extract failed for {}", pdf_path.display()))
     }
 }
 
@@ -434,6 +466,63 @@ fn split_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
+/// Light post-processing to improve chunking on raw PDF text.
+///
+/// - Normalizes line endings
+/// - Joins wrapped lines within paragraphs
+/// - Preserves paragraph breaks (blank lines)
+/// - Repairs simple hyphen line breaks (e.g., "lin-\n guistic")
+pub fn normalize_extracted_text(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::new();
+
+    for block in normalized.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+
+        let mut paragraph = String::new();
+        let mut pending_hyphen = false;
+
+        for line in block.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            if pending_hyphen {
+                paragraph.push_str(line);
+                pending_hyphen = false;
+            } else if paragraph.is_empty() {
+                paragraph.push_str(line);
+            } else {
+                paragraph.push(' ');
+                paragraph.push_str(line);
+            }
+
+            if paragraph.ends_with('-') {
+                paragraph.pop();
+                pending_hyphen = true;
+            }
+        }
+
+        let collapsed = paragraph
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .join(" ");
+
+        if !collapsed.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&collapsed);
+        }
+    }
+
+    out
+}
+
 // ============================================================================
 // Extraction Worker
 // ============================================================================
@@ -649,10 +738,16 @@ impl<E: PdfExtractor> ExtractionWorker<E> {
                         }
 
                         // Chunk the text and create document rows
-                        let chunks = chunk_text(&extracted_text, TARGET_CHUNK_TOKENS);
+                        let normalized_text = if self.extractor.name() == "extract-pdf" {
+                            normalize_extracted_text(&extracted_text)
+                        } else {
+                            extracted_text.clone()
+                        };
+                        let chunks = chunk_text(&normalized_text, TARGET_CHUNK_TOKENS);
                         eprintln!(
-                            "[extraction] Extracted {} chars, {} chunks from {:?}",
+                            "[extraction] Extracted {} chars (normalized {}), {} chunks from {:?}",
                             extracted_text.len(),
+                            normalized_text.len(),
                             chunks.len(),
                             path
                         );

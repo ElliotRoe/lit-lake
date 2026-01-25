@@ -50,3 +50,4 @@ build/
 build/bin
 node_modules
 frontend/build
+scratch/
