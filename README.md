@@ -22,33 +22,49 @@ Claude is the easiest and fastest way to get set up with Lit Lake. If you do not
 > Note: If double clicking does not immediately bring you to the installation screen within Claude, go to Settings > Extensions > Advanced settings > Install Extension
 
 #### Configuration
-During installation, you may be prompted to configure the **Zotero DB** path. This is **optional** — if your Zotero is installed in the default location (`~/Zotero/`), Lit Lake will find it automatically.
+During installation, you can configure the following options. All are **optional** with sensible defaults.
 
-If you've moved your Zotero data directory or use a custom location, set this to the path of your `zotero.sqlite` file. For example:
+| Option | Description | Default |
+|--------|-------------|---------|
+| **Zotero DB** | Path to your `zotero.sqlite` file | `~/Zotero/zotero.sqlite` |
+| **Lit Lake Folder** | Parent folder where the `LitLake` data directory will be created | `~/LitLake` |
+| **Gemini API Key** | Enables higher-quality PDF extraction via Gemini | Local extraction (no API needed) |
+| **Disable Embedding** | Turns off background embedding processes to save battery | Off (embedding runs) |
+
+**Zotero DB**: Only set this if you've moved your Zotero data directory to a custom location. Examples:
 - **macOS/Linux**: `/Users/yourname/Custom/Zotero/zotero.sqlite`
 - **Windows**: `C:\Users\yourname\Zotero\zotero.sqlite`
 
-You can also optionally set a **Lit Lake Folder**. This is the parent folder where the `LitLake` data directory will be created. If you select a folder that is not named `LitLake`, the app will create `LitLake` inside it. If left blank, Lit Lake uses `~/LitLake`.
+**Lit Lake Folder**: If you select a folder that is not named `LitLake`, the app will create a `LitLake` subdirectory inside it. This is where your database and AI models are stored.
+
+**Gemini API Key**: PDF text extraction works out of the box using a local pure-Rust extractor. If you provide a [Google AI Studio](https://aistudio.google.com/) API key, Lit Lake will use Gemini instead, which often produces cleaner, more structured output.
+
+**Disable Embedding**: Enable this option to stop background embedding processes. Useful when you're on battery power and want to conserve energy. Note: semantic search won't work for new documents until embeddings are generated.
 
 #### First Run
 On first launch, Lit Lake will:
 1. **Automatically sync your Zotero library** — no manual action needed
 2. **Download AI models** (~500MB total) — this happens once and may take a few minutes
+3. **Begin extracting PDF text** — runs in the background, progress visible via `library_status`
 
 You can check progress by asking Claude to call `library_status`. Once `init_status` shows "Ready", semantic search is available.
 
+> **Note**: If you enabled "Disable Embedding" for battery savings, semantic search won't work until you disable that option and let the embedding process run.
+
 #### PDF Full-Text Extraction
-Lit Lake extracts PDF text locally by default using the `extract-pdf` crate (pure Rust, no external system dependencies). This keeps the MCP shippable as a static binary.
+Lit Lake automatically extracts text from your PDF attachments so Claude can search and analyze full papers — not just titles and abstracts.
 
-If you set `GEMINI_API_KEY` (from [Google AI Studio](https://aistudio.google.com/)), Lit Lake will use Gemini instead, which often yields cleaner, more structured markdown.
+**How it works:**
+- **By default**, Lit Lake uses a local pure-Rust extractor (`pdf-extract`). No API keys required, works offline, and keeps the binary fully self-contained.
+- **With Gemini API key**, extraction uses Google's Gemini model, which often produces cleaner markdown with better structure preservation.
 
-When extraction runs, Lit Lake will:
-1. **Automatically extract text** from PDF attachments (local by default, Gemini if configured)
-2. **Lightly normalize raw text** (fix line wraps and hyphenation) to improve chunking
-3. **Store the full text** in the database for direct access
-4. **Create searchable chunks** that are embedded for semantic search within full papers
+**What happens during extraction:**
+1. Text is extracted from each PDF attachment
+2. Raw text is normalized (line wraps and hyphenation fixed) to improve quality
+3. Full text is stored in the database for direct access
+4. Text is split into searchable chunks with embeddings for semantic search
 
-You can check extraction progress via `library_status` — look for the `extraction` status counts.
+Check extraction progress via `library_status` — look for the `extraction` status counts.
 
 ### Other LLMs
 To use Lit Lake with other LLM clients (like LM Studio, Cherry studio, etc), you'll just need to download the binary file and make it executable then configure it globally. Honestly, I haven't configured it yet with another client, if you are attempting, please reach out and I can help, then I'll add the instructions back here.
