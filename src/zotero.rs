@@ -65,14 +65,14 @@ impl ZoteroReader {
         )?;
 
         // Query to get items. We'll join to get basic metadata.
-        // Zotero field IDs: 1=title, 2=abstractNote, 14=date (publication date)
+        // Zotero field IDs: 1=title, 2=abstractNote, 6=date (first 4 characters represent year)
         let mut stmt = conn.prepare(
             "SELECT 
                 i.itemID,
                 i.key,
                 title_val.value as title,
                 abstract_val.value as abstract,
-                date_val.value as date,
+                SUBSTR(date_val.value, 1, 4) as date,
                 (
                     SELECT GROUP_CONCAT(
                         CASE 
@@ -95,8 +95,8 @@ impl ZoteroReader {
             -- Get abstract (fieldID = 2)
             LEFT JOIN itemData abstract_data ON i.itemID = abstract_data.itemID AND abstract_data.fieldID = 2
             LEFT JOIN itemDataValues abstract_val ON abstract_data.valueID = abstract_val.valueID
-            -- Get publication date (fieldID = 14)
-            LEFT JOIN itemData date_data ON i.itemID = date_data.itemID AND date_data.fieldID = 14
+            -- Get publication date (fieldID = 6)
+            LEFT JOIN itemData date_data ON i.itemID = date_data.itemID AND date_data.fieldID = 6
             LEFT JOIN itemDataValues date_val ON date_data.valueID = date_val.valueID
             
             WHERE it.typeName NOT IN ('attachment', 'note', 'annotation')
