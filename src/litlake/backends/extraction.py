@@ -1,5 +1,4 @@
 from litlake.providers.extraction import (
-    DoclingExtractionProvider,
     ErrorClass,
     ExtractionProvider,
     ExtractionResult,
@@ -11,11 +10,8 @@ from litlake.providers.extraction import (
 ExtractionBackend = ExtractionProvider
 LocalPdfExtractionBackend = LocalPdfExtractionProvider
 GeminiExtractionBackend = GeminiExtractionProvider
-DoclingExtractionBackend = DoclingExtractionProvider
 
 __all__ = [
-    "DoclingExtractionBackend",
-    "DoclingExtractionProvider",
     "ErrorClass",
     "ExtractionBackend",
     "ExtractionProvider",

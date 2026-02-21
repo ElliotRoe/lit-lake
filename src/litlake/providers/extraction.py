@@ -212,46 +212,10 @@ class GeminiExtractionProvider:
         return "retryable_io"
 
 
-@dataclass
-class DoclingExtractionProvider:
-    name: str = "docling"
-    version: str = "docling"
-
-    def __post_init__(self) -> None:
-        try:
-            from docling.document_converter import DocumentConverter  # type: ignore
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError("Docling provider requested but docling is not installed") from exc
-        self._converter = DocumentConverter()
-
-    def extract(self, locator: FileLocator) -> ExtractionResult:
-        source = locator.file_path or locator.storage_uri
-        if not source:
-            raise FileNotFoundError("No file path provided")
-        path = Path(source).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-
-        result = self._converter.convert(str(path))
-        doc = result.document
-        markdown = doc.export_to_markdown()
-        return ExtractionResult(text=markdown)
-
-    def classify_error(self, exc: Exception) -> ErrorClass:
-        if isinstance(exc, RuntimeError):
-            return "permanent_unsupported"
-        if isinstance(exc, FileNotFoundError):
-            return "permanent_not_found"
-        if isinstance(exc, ValueError):
-            return "permanent_validation"
-        return "retryable_io"
-
-
 __all__ = [
     "ErrorClass",
     "ExtractionProvider",
     "ExtractionResult",
     "GeminiExtractionProvider",
     "LocalPdfExtractionProvider",
-    "DoclingExtractionProvider",
 ]

@@ -5,7 +5,6 @@ from litlake.providers.embedding import (
     RerankProvider,
 )
 from litlake.providers.extraction import (
-    DoclingExtractionProvider,
     ErrorClass,
     ExtractionProvider,
     ExtractionResult,
@@ -14,7 +13,6 @@ from litlake.providers.extraction import (
 )
 
 __all__ = [
-    "DoclingExtractionProvider",
     "EmbeddingProvider",
     "ErrorClass",
     "ExtractionProvider",
