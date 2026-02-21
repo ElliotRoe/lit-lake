@@ -141,6 +141,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     # Add forward-compatible provenance and storage fields.
     _ensure_column(conn, "documents", "embedding_backend", "embedding_backend TEXT")
     _ensure_column(conn, "documents", "embedding_model", "embedding_model TEXT")
+    _ensure_column(conn, "documents", "page_start", "page_start INTEGER")
+    _ensure_column(conn, "documents", "page_end", "page_end INTEGER")
 
     _ensure_column(conn, "document_files", "extraction_backend", "extraction_backend TEXT")
     _ensure_column(

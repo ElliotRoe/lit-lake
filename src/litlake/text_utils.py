@@ -95,4 +95,79 @@ def normalize_extracted_text(text: str) -> str:
     return "\n\n".join(out_parts)
 
 
-__all__ = ["TARGET_CHUNK_TOKENS", "chunk_text", "normalize_extracted_text"]
+def _page_number_for_offset(
+    offset: int,
+    page_ranges: list[tuple[int, int, int]],
+) -> int | None:
+    if not page_ranges:
+        return None
+
+    for idx, (page_num, start, end) in enumerate(page_ranges):
+        if start <= offset < end:
+            return page_num
+
+        if idx < len(page_ranges) - 1:
+            next_start = page_ranges[idx + 1][1]
+            if end <= offset < next_start:
+                return page_ranges[idx + 1][0]
+
+    if offset >= page_ranges[-1][2]:
+        return page_ranges[-1][0]
+
+    return None
+
+
+def map_chunks_to_page_ranges(
+    chunks: list[str],
+    page_texts: list[str],
+    separator: str = "\n\n",
+) -> list[tuple[int | None, int | None]]:
+    """Best-effort mapping of chunk text to 1-based physical PDF page ranges."""
+
+    if not page_texts:
+        return [(None, None) for _ in chunks]
+
+    full_text = separator.join(page_texts)
+    if not full_text:
+        return [(None, None) for _ in chunks]
+
+    page_ranges: list[tuple[int, int, int]] = []
+    cursor = 0
+    for idx, page_text in enumerate(page_texts, start=1):
+        start = cursor
+        end = start + len(page_text)
+        page_ranges.append((idx, start, end))
+        cursor = end
+        if idx < len(page_texts):
+            cursor += len(separator)
+
+    spans: list[tuple[int | None, int | None]] = []
+    search_from = 0
+
+    for chunk in chunks:
+        if not chunk:
+            spans.append((None, None))
+            continue
+
+        start_offset = full_text.find(chunk, search_from)
+        if start_offset == -1:
+            start_offset = full_text.find(chunk)
+        if start_offset == -1:
+            spans.append((None, None))
+            continue
+
+        end_offset = start_offset + len(chunk) - 1
+        page_start = _page_number_for_offset(start_offset, page_ranges)
+        page_end = _page_number_for_offset(end_offset, page_ranges)
+        spans.append((page_start, page_end))
+        search_from = start_offset + len(chunk)
+
+    return spans
+
+
+__all__ = [
+    "TARGET_CHUNK_TOKENS",
+    "chunk_text",
+    "normalize_extracted_text",
+    "map_chunks_to_page_ranges",
+]

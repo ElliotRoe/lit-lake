@@ -13,7 +13,12 @@ from litlake.providers.embedding import EmbeddingProvider
 from litlake.providers.extraction import ErrorClass, ExtractionProvider
 from litlake.queue import ClaimedJob, QueueEngine, QueuePolicy
 from litlake.storage import FileLocator, StorageProvider
-from litlake.text_utils import TARGET_CHUNK_TOKENS, chunk_text, normalize_extracted_text
+from litlake.text_utils import (
+    TARGET_CHUNK_TOKENS,
+    chunk_text,
+    map_chunks_to_page_ranges,
+    normalize_extracted_text,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -306,7 +311,16 @@ class ExtractionJobHandler:
                 if self.extraction_provider.name == "local"
                 else extracted_text
             )
+            page_texts = result.page_texts
+            if self.extraction_provider.name == "local" and page_texts:
+                page_texts = [normalize_extracted_text(page) for page in page_texts]
+                normalized_text = "\n\n".join(page_texts)
             chunks = chunk_text(normalized_text, TARGET_CHUNK_TOKENS)
+            page_spans = (
+                map_chunks_to_page_ranges(chunks, page_texts)
+                if page_texts is not None
+                else [(None, None) for _ in chunks]
+            )
 
             conn.execute("BEGIN")
             conn.execute(
@@ -344,15 +358,17 @@ class ExtractionJobHandler:
 
             new_doc_ids: list[int] = []
             for idx, chunk in enumerate(chunks):
+                page_start, page_end = page_spans[idx]
                 cur = conn.execute(
                     """
                     INSERT INTO documents (
                         reference_id, document_file_id, kind, content,
-                        chunk_index, embedding_status, embedding_backend, embedding_model
+                        chunk_index, page_start, page_end,
+                        embedding_status, embedding_backend, embedding_model
                     )
-                    VALUES (?, ?, 'pdf_chunk', ?, ?, 'pending', NULL, NULL)
+                    VALUES (?, ?, 'pdf_chunk', ?, ?, ?, ?, 'pending', NULL, NULL)
                     """,
-                    (reference_id, file_id, chunk, idx),
+                    (reference_id, file_id, chunk, idx, page_start, page_end),
                 )
                 new_doc_ids.append(int(cur.lastrowid))
 

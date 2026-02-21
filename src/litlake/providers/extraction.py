@@ -21,6 +21,7 @@ ErrorClass = Literal[
 @dataclass(frozen=True)
 class ExtractionResult:
     text: str
+    page_texts: list[str] | None = None
 
 
 class ExtractionProvider(Protocol):
@@ -58,7 +59,7 @@ class LocalPdfExtractionProvider:
             text = page.extract_text() or ""
             pages.append(text)
 
-        return ExtractionResult(text="\n\n".join(pages))
+        return ExtractionResult(text="\n\n".join(pages), page_texts=pages)
 
     def classify_error(self, exc: Exception) -> ErrorClass:
         try:
