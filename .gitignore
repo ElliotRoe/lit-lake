@@ -51,3 +51,13 @@ build/bin
 node_modules
 frontend/build
 scratch/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Local accidental root-tilde directory
+/~/
+skills/*

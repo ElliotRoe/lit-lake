@@ -1,0 +1,39 @@
+[project]
+name = "lit-lake-mcp"
+version = "0.1.0"
+description = "Lit Lake MCP server"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "Elliot Roe" }]
+dependencies = [
+  "mcp[cli]>=1.0.0,<2",
+  "python-dotenv>=1.0.1,<2",
+  "requests>=2.32.3,<3",
+  "sqlite-vec>=0.1.6,<0.2",
+  "fastembed>=0.7.0,<1",
+  "pypdf>=5.0.0,<6",
+  "pymupdf>=1.25.0,<2",
+]
+
+[project.optional-dependencies]
+docling = ["docling>=2.0.0"]
+
+[project.scripts]
+lit-lake-mcp = "litlake.server:main"
+lit-lake-queue = "litlake.maintenance:main"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["litlake*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

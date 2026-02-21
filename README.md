@@ -3,6 +3,8 @@
 > ⚠️ **UNDER CONSTRUCTION** ⚠️  
 > This project (and the README itself for that matter) is actively being developed. Features may be incomplete, documentation may be outdated, and breaking changes may occur. Use at your own risk and check back for updates!
 
+> Runtime update: Lit Lake now includes a Python + UV MCPB server implementation with durable queue/audit tables (`jobs`, `job_attempts`, `worker_runs`).
+
 Connect [Claude](https://www.anthropic.com/claude) (and others) to [Zotero](https://www.zotero.org/) with one click. Discover related papers through semantic search, analyze references with full context and allow Claude to access the full text (including embedded images) of your library.
 
 ## Installation
@@ -68,6 +70,11 @@ Check extraction progress via `library_status` — look for the `extraction` sta
 
 ### Other LLMs
 To use Lit Lake with other LLM clients (like LM Studio, Cherry studio, etc), you'll just need to download the binary file and make it executable then configure it globally. Honestly, I haven't configured it yet with another client, if you are attempting, please reach out and I can help, then I'll add the instructions back here.
+
+## Queue Maintenance
+
+- `uv run lit-lake-queue stats`  
+  Shows durable queue depth by queue/state.
 ## Use Cases
 
 #### Paper Discovery & Search 
