@@ -15,8 +15,8 @@ from litlake.queue import ClaimedJob, QueueEngine, QueuePolicy
 from litlake.storage import FileLocator, StorageProvider
 from litlake.text_utils import (
     TARGET_CHUNK_TOKENS,
-    chunk_text,
-    map_chunks_to_page_ranges,
+    chunk_text_with_spans,
+    map_chunk_spans_to_page_ranges,
     normalize_extracted_text,
 )
 
@@ -315,9 +315,10 @@ class ExtractionJobHandler:
             if self.extraction_provider.name == "local" and page_texts:
                 page_texts = [normalize_extracted_text(page) for page in page_texts]
                 normalized_text = "\n\n".join(page_texts)
-            chunks = chunk_text(normalized_text, TARGET_CHUNK_TOKENS)
+            chunk_spans = chunk_text_with_spans(normalized_text, TARGET_CHUNK_TOKENS)
+            chunks = [chunk for chunk, _, _ in chunk_spans]
             page_spans = (
-                map_chunks_to_page_ranges(chunks, page_texts)
+                map_chunk_spans_to_page_ranges(chunk_spans, page_texts)
                 if page_texts is not None
                 else [(None, None) for _ in chunks]
             )
