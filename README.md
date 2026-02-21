@@ -65,8 +65,10 @@ Lit Lake automatically extracts text from your PDF attachments so Claude can sea
 2. Raw text is normalized (line wraps and hyphenation fixed) to improve quality
 3. Full text is stored in the database for direct access
 4. Text is split into searchable chunks with embeddings for semantic search
+5. When supported by the active extraction backend, each chunk also gets a best-effort physical PDF page range (`page_start`/`page_end`) for citation-friendly references
 
 Check extraction progress via `library_status` — look for the `extraction` status counts.
+Page ranges are optional and backend-dependent. Backends that do not return page metadata will leave these fields empty.
 
 ### Other LLMs
 To use Lit Lake with other LLM clients (like LM Studio, Cherry studio, etc), you'll just need to download the binary file and make it executable then configure it globally. Honestly, I haven't configured it yet with another client, if you are attempting, please reach out and I can help, then I'll add the instructions back here.
