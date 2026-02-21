@@ -37,3 +37,8 @@ include = ["litlake*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

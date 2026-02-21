@@ -614,6 +614,15 @@ wheels = [
 ]
 
 [[package]]
+name = "iniconfig"
+version = "2.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc35312d08ba8bf51fdd999c576889fc2c24cb97f4f10/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730", size = 20503, upload-time = "2025-10-18T21:55:43.219Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
+]
+
+[[package]]
 name = "jinja2"
 version = "3.1.6"
 source = { registry = "https://pypi.org/simple" }
@@ -701,6 +710,11 @@ docling = [
     { name = "docling" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "docling", marker = "extra == 'docling'", specifier = ">=2.0.0" },
@@ -713,6 +727,9 @@ requires-dist = [
     { name = "sqlite-vec", specifier = ">=0.1.6,<0.2" },
 ]
 provides-extras = ["docling"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.0.2" }]
 
 [[package]]
 name = "loguru"
@@ -1800,6 +1817,22 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ac/38/f77e7792b4fba37f0e3d78db52fb7288d41db3c46ed28906fb940bc3e325/pypdfium2-5.5.0-py3-none-win32.whl", hash = "sha256:ec62a00223d1222d2f35c0866dd79cdc24da070738544cdf51b17d332d4a7389", size = 3001772, upload-time = "2026-02-18T23:22:32.367Z" },
     { url = "https://files.pythonhosted.org/packages/3e/c5/0d7ba53148262f78d8eee528a504764f78ae7bebf434a53714294b1fd973/pypdfium2-5.5.0-py3-none-win_amd64.whl", hash = "sha256:15c32fbeebb5198afa785dd03e98906ebb4eded9ef8862e10f833c37b4a18786", size = 3107710, upload-time = "2026-02-18T23:22:33.925Z" },
     { url = "https://files.pythonhosted.org/packages/29/ad/fae449d2ed7b3088c6ab088f53fc6a9e9af26ccc9e0477d4182e373c4dd8/pypdfium2-5.5.0-py3-none-win_arm64.whl", hash = "sha256:f618af0884c16c768539c44933a255039131dbbf39d68eded020da4f14958d73", size = 2938315, upload-time = "2026-02-18T23:22:35.907Z" },
+]
+
+[[package]]
+name = "pytest"
+version = "9.0.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "iniconfig" },
+    { name = "packaging" },
+    { name = "pluggy" },
+    { name = "pygments" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d1/db/7ef3487e0fb0049ddb5ce41d3a49c235bf9ad299b6a25d5780a89f19230f/pytest-9.0.2.tar.gz", hash = "sha256:75186651a92bd89611d1d9fc20f0b4345fd827c41ccd5c299a868a05d70edf11", size = 1568901, upload-time = "2025-12-06T21:30:51.014Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/ab/b3226f0bd7cdcf710fbede2b3548584366da3b19b5021e74f5bde2a8fa3f/pytest-9.0.2-py3-none-any.whl", hash = "sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b", size = 374801, upload-time = "2025-12-06T21:30:49.154Z" },
 ]
 
 [[package]]
