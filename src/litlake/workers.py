@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import struct
@@ -10,7 +11,12 @@ from typing import Protocol
 from litlake.config import Settings
 from litlake.db import connect_db, enqueue_job
 from litlake.providers.embedding import EmbeddingProvider
-from litlake.providers.extraction import ErrorClass, ExtractionProvider
+from litlake.providers.extraction import (
+    ErrorClass,
+    ExtractionProvider,
+    PDF_MIME_TYPE,
+    canonicalize_mime_type,
+)
 from litlake.queue import ClaimedJob, QueueEngine, QueuePolicy
 from litlake.storage import FileLocator, StorageProvider
 from litlake.text_utils import (
@@ -22,6 +28,7 @@ from litlake.text_utils import (
 
 
 logger = logging.getLogger(__name__)
+FULLTEXT_CHUNK_KIND = "fulltext_chunk"
 
 
 def _is_permanent(error_class: ErrorClass) -> bool:
@@ -35,6 +42,10 @@ class WorkerRuntimeContext:
 
 
 class StaleClaimError(RuntimeError):
+    pass
+
+
+class SkippedExtractionError(RuntimeError):
     pass
 
 
@@ -267,6 +278,22 @@ class ExtractionJobHandler:
         self.storage_provider = storage_provider
         self.provider_name = extraction_provider.name
         self.provider_version = extraction_provider.version
+        self._supported_mime_types = {
+            canonicalize_mime_type(mime)
+            for mime in extraction_provider.supported_mime_types
+            if canonicalize_mime_type(mime)
+        }
+
+    def _normalize_mime_type(self, mime_type: str | None) -> str:
+        normalized_mime = canonicalize_mime_type(mime_type)
+        if not normalized_mime:
+            raise ValueError("document_file missing mime_type")
+        if normalized_mime not in self._supported_mime_types:
+            raise SkippedExtractionError(
+                f"Extraction backend '{self.extraction_provider.name}' does not support mime type: "
+                f"{normalized_mime}"
+            )
+        return normalized_mime
 
     def handle_claimed_job(
         self,
@@ -278,7 +305,7 @@ class ExtractionJobHandler:
         try:
             row = conn.execute(
                 """
-                SELECT id, reference_id, file_path, storage_kind, storage_uri
+                SELECT id, reference_id, file_path, mime_type, storage_kind, storage_uri
                 FROM document_files
                 WHERE id = ?
                 """,
@@ -289,10 +316,12 @@ class ExtractionJobHandler:
 
             file_id = int(row[0])
             reference_id = int(row[1])
+            mime_type = row[3]
+            normalized_mime = self._normalize_mime_type(mime_type)
             locator = FileLocator(
-                storage_kind=(row[3] or "local"),
+                storage_kind=(row[4] or "local"),
                 file_path=row[2],
-                storage_uri=row[4],
+                storage_uri=row[5],
             )
             resolved = self.storage_provider.resolve(locator)
             normalized_locator = FileLocator(
@@ -301,18 +330,15 @@ class ExtractionJobHandler:
                 storage_uri=str(resolved),
             )
 
-            result = self.extraction_provider.extract(normalized_locator)
+            result = self.extraction_provider.extract(normalized_locator, mime_type=normalized_mime)
             extracted_text = result.text or ""
             if not extracted_text.strip():
                 raise ValueError(f"Extraction produced empty text for {resolved}")
 
-            normalized_text = (
-                normalize_extracted_text(extracted_text)
-                if self.extraction_provider.name == "local"
-                else extracted_text
-            )
+            is_pdf = normalized_mime == PDF_MIME_TYPE
+            normalized_text = normalize_extracted_text(extracted_text) if is_pdf else extracted_text
             page_texts = result.page_texts
-            if self.extraction_provider.name == "local" and page_texts:
+            if is_pdf and page_texts:
                 page_texts = [normalize_extracted_text(page) for page in page_texts]
                 normalized_text = "\n\n".join(page_texts)
             chunk_spans = chunk_text_with_spans(normalized_text, TARGET_CHUNK_TOKENS)
@@ -323,6 +349,14 @@ class ExtractionJobHandler:
                 else [(None, None) for _ in chunks]
             )
 
+            file_metadata: dict[str, object] = {
+                "schema_version": 1,
+                "origin": {"mime_type": normalized_mime},
+            }
+            if result.metadata:
+                file_metadata["extraction"] = result.metadata
+            file_metadata_json = json.dumps(file_metadata, separators=(",", ":"), ensure_ascii=False)
+
             conn.execute("BEGIN")
             conn.execute(
                 """
@@ -332,6 +366,7 @@ class ExtractionJobHandler:
                     extraction_error = NULL,
                     extraction_backend = ?,
                     extraction_backend_version = ?,
+                    metadata_json = ?,
                     storage_kind = 'local',
                     storage_uri = ?
                 WHERE id = ?
@@ -340,36 +375,60 @@ class ExtractionJobHandler:
                     extracted_text,
                     self.extraction_provider.name,
                     self.extraction_provider.version,
+                    file_metadata_json,
                     str(resolved),
                     file_id,
                 ),
             )
 
             existing_chunk_ids = conn.execute(
-                "SELECT id FROM documents WHERE document_file_id = ? AND kind = 'pdf_chunk'",
-                (file_id,),
+                "SELECT id FROM documents WHERE document_file_id = ? AND kind = ?",
+                (file_id, FULLTEXT_CHUNK_KIND),
             ).fetchall()
             for chunk_row in existing_chunk_ids:
                 conn.execute("DELETE FROM vec_documents WHERE rowid = ?", (int(chunk_row[0]),))
 
             conn.execute(
-                "DELETE FROM documents WHERE document_file_id = ? AND kind = 'pdf_chunk'",
-                (file_id,),
+                "DELETE FROM documents WHERE document_file_id = ? AND kind = ?",
+                (file_id, FULLTEXT_CHUNK_KIND),
             )
 
             new_doc_ids: list[int] = []
             for idx, chunk in enumerate(chunks):
                 page_start, page_end = page_spans[idx]
+                chunk_metadata: dict[str, object] = {
+                    "schema_version": 1,
+                    "origin": {"mime_type": normalized_mime},
+                }
+                if result.metadata:
+                    chunk_metadata["extraction"] = result.metadata
+                if page_start is not None or page_end is not None:
+                    chunk_metadata["loc"] = {
+                        "page_start": page_start,
+                        "page_end": page_end,
+                    }
+                chunk_metadata_json = json.dumps(
+                    chunk_metadata,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
                 cur = conn.execute(
                     """
                     INSERT INTO documents (
                         reference_id, document_file_id, kind, content,
-                        chunk_index, page_start, page_end,
+                        chunk_index, metadata_json,
                         embedding_status, embedding_backend, embedding_model
                     )
-                    VALUES (?, ?, 'pdf_chunk', ?, ?, ?, ?, 'pending', NULL, NULL)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL)
                     """,
-                    (reference_id, file_id, chunk, idx, page_start, page_end),
+                    (
+                        reference_id,
+                        file_id,
+                        FULLTEXT_CHUNK_KIND,
+                        chunk,
+                        idx,
+                        chunk_metadata_json,
+                    ),
                 )
                 new_doc_ids.append(int(cur.lastrowid))
 
@@ -395,6 +454,47 @@ class ExtractionJobHandler:
             if not completed:
                 raise StaleClaimError(f"Lost claim while completing job {job.job_id}")
             conn.commit()
+        except SkippedExtractionError as exc:
+            conn.rollback()
+            try:
+                conn.execute("BEGIN")
+                conn.execute(
+                    """
+                    UPDATE document_files
+                    SET extraction_status = 'skipped',
+                        extraction_error = ?,
+                        extraction_backend = ?,
+                        extraction_backend_version = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(exc),
+                        self.extraction_provider.name,
+                        self.extraction_provider.version,
+                        job.entity_id,
+                    ),
+                )
+                completed = queue_engine.complete_success(
+                    job,
+                    backend_name=self.extraction_provider.name,
+                    backend_version=self.extraction_provider.version,
+                    metrics={"skipped": 1},
+                    commit=False,
+                )
+                if not completed:
+                    raise StaleClaimError(
+                        f"Lost claim while marking skipped for job {job.job_id}"
+                    )
+                conn.commit()
+            except StaleClaimError as stale:
+                conn.rollback()
+                logger.warning("%s", stale)
+            except Exception:  # noqa: BLE001
+                conn.rollback()
+                logger.exception(
+                    "Failed to persist extraction skipped state for job_id=%s",
+                    job.job_id,
+                )
         except Exception as exc:  # noqa: BLE001
             conn.rollback()
             if isinstance(exc, StaleClaimError):

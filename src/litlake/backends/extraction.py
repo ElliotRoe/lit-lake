@@ -3,12 +3,13 @@ from litlake.providers.extraction import (
     ExtractionProvider,
     ExtractionResult,
     GeminiExtractionProvider,
-    LocalPdfExtractionProvider,
+    LocalFileExtractionProvider,
 )
 
 # Backward-compatible aliases for older imports.
 ExtractionBackend = ExtractionProvider
-LocalPdfExtractionBackend = LocalPdfExtractionProvider
+LocalFileExtractionBackend = LocalFileExtractionProvider
+LocalPdfExtractionBackend = LocalFileExtractionProvider
 GeminiExtractionBackend = GeminiExtractionProvider
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "ExtractionResult",
     "GeminiExtractionBackend",
     "GeminiExtractionProvider",
+    "LocalFileExtractionBackend",
+    "LocalFileExtractionProvider",
     "LocalPdfExtractionBackend",
-    "LocalPdfExtractionProvider",
 ]

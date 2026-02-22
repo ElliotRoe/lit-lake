@@ -34,11 +34,10 @@ class SqlReadonlyTests(unittest.TestCase):
         with self.assertRaises(Exception):
             execute_readonly_query(self.conn, "PRAGMA writable_schema = ON")
 
-    def test_documents_include_page_range_columns(self) -> None:
+    def test_documents_include_metadata_json_column(self) -> None:
         rows = self.conn.execute("PRAGMA table_info(documents)").fetchall()
         columns = {row[1] for row in rows}
-        self.assertIn("page_start", columns)
-        self.assertIn("page_end", columns)
+        self.assertIn("metadata_json", columns)
 
 
 if __name__ == "__main__":

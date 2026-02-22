@@ -60,4 +60,5 @@ __pycache__/
 
 # Local accidental root-tilde directory
 /~/
-skills/*
+.agents/*
+*.mcpb

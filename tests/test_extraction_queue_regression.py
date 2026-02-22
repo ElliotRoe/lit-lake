@@ -6,7 +6,7 @@ from pathlib import Path
 
 from litlake.config import Paths, Settings
 from litlake.db import connect_db, enqueue_job, init_db, seed_pending_jobs
-from litlake.providers.extraction import LocalPdfExtractionProvider
+from litlake.providers.extraction import LocalFileExtractionProvider
 from litlake.queue import QueueEngine, QueuePolicy
 from litlake.storage import LocalFSProvider
 from litlake.workers import ExtractionJobHandler, WorkerRuntimeContext
@@ -47,6 +47,7 @@ class ExtractionQueueRegressionTests(unittest.TestCase):
             queue_max_attempts=policy.max_attempts,
             queue_backoff_base_seconds=policy.backoff_base_seconds,
             queue_backoff_max_seconds=policy.backoff_max_seconds,
+            extraction_backend="local",
             gemini_api_key=None,
             zotero_db_path=None,
         )
@@ -62,10 +63,10 @@ class ExtractionQueueRegressionTests(unittest.TestCase):
         file_id = conn.execute(
             """
             INSERT INTO document_files(
-                reference_id, file_path, mime_type, label,
+                reference_id, file_path, mime_type,
                 extraction_status, storage_kind, storage_uri
             )
-            VALUES (?, ?, 'application/pdf', 'main_pdf', 'pending', 'local', ?)
+            VALUES (?, ?, 'application/pdf', 'pending', 'local', ?)
             """,
             (int(ref_id), str(pdf_path), str(pdf_path)),
         ).lastrowid
@@ -76,10 +77,10 @@ class ExtractionQueueRegressionTests(unittest.TestCase):
         enqueue_job(
             conn,
             queue_name="extraction",
-            job_type="extract_pdf",
+            job_type="extract_file",
             entity_type="document_file",
             entity_id=file_id,
-            dedupe_key=f"extract_pdf:{file_id}",
+            dedupe_key=f"extract_file:{file_id}",
             payload={"document_file_id": file_id},
             max_attempts=max_attempts,
         )
@@ -100,7 +101,7 @@ class ExtractionQueueRegressionTests(unittest.TestCase):
             queue_policy=policy,
         )
         handler = ExtractionJobHandler(
-            extraction_provider=LocalPdfExtractionProvider(),
+            extraction_provider=LocalFileExtractionProvider(),
             storage_provider=LocalFSProvider(),
         )
         return engine, handler, ctx

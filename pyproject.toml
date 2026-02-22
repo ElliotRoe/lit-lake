@@ -14,10 +14,8 @@ dependencies = [
   "fastembed>=0.7.0,<1",
   "pypdf>=5.0.0,<6",
   "pymupdf>=1.25.0,<2",
+  "trafilatura>=2.0.0,<3",
 ]
-
-[project.optional-dependencies]
-docling = ["docling>=2.0.0"]
 
 [project.scripts]
 lit-lake-mcp = "litlake.server:main"

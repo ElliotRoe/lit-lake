@@ -54,6 +54,7 @@ class Settings:
     queue_max_attempts: int
     queue_backoff_base_seconds: int
     queue_backoff_max_seconds: int
+    extraction_backend: str
     gemini_api_key: str | None
     zotero_db_path: str | None
 
@@ -90,6 +91,9 @@ def resolve_paths() -> Paths:
 def load_settings() -> Settings:
     paths = resolve_paths()
     worker_id = _clean_env(os.getenv("WORKER_ID")) or f"{socket.gethostname()}-lit-lake"
+    extraction_backend = (_clean_env(os.getenv("EXTRACTION_BACKEND")) or "local").lower()
+    if extraction_backend not in {"local", "gemini"}:
+        extraction_backend = "local"
 
     return Settings(
         paths=paths,
@@ -100,6 +104,7 @@ def load_settings() -> Settings:
         queue_max_attempts=_env_int("QUEUE_MAX_ATTEMPTS", default=5, minimum=1),
         queue_backoff_base_seconds=_env_int("QUEUE_BACKOFF_BASE_SECONDS", default=5, minimum=1),
         queue_backoff_max_seconds=_env_int("QUEUE_BACKOFF_MAX_SECONDS", default=900, minimum=5),
+        extraction_backend=extraction_backend,
         gemini_api_key=_clean_env(os.getenv("GEMINI_API_KEY")),
         zotero_db_path=_clean_env(os.getenv("ZOTERO_DB_PATH")),
     )

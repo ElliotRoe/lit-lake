@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from litlake.storage import FileLocator
 
@@ -17,18 +19,141 @@ ErrorClass = Literal[
     "permanent_unsupported",
 ]
 
+PDF_MIME_TYPE = "application/pdf"
+HTML_MIME_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+SUPPORTED_EXTRACTION_MIME_TYPES = frozenset({PDF_MIME_TYPE, *HTML_MIME_TYPES})
+
+
+def canonicalize_mime_type(mime_type: str | None) -> str | None:
+    normalized = (mime_type or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"application/x-pdf"}:
+        return PDF_MIME_TYPE
+    if normalized in HTML_MIME_TYPES:
+        return "text/html"
+    return normalized
+
+
+def _extract_source(locator: FileLocator) -> str:
+    source = locator.file_path or locator.storage_uri
+    if not source:
+        raise FileNotFoundError("No file path provided")
+    return source
+
+
+def _resolve_path(locator: FileLocator) -> Path:
+    source = _extract_source(locator)
+    path = Path(source).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    return path
+
+
+def _normalize_mime_type(mime_type: str | None, path: Path) -> str:
+    normalized = canonicalize_mime_type(mime_type) or ""
+    if not normalized:
+        guessed, _ = mimetypes.guess_type(path.name)
+        normalized = canonicalize_mime_type(guessed) or ""
+    if normalized == PDF_MIME_TYPE:
+        return PDF_MIME_TYPE
+    if normalized == "text/html":
+        return "text/html"
+    raise ValueError(f"Unsupported mime type for extraction: {normalized or 'unknown'}")
+
+
+class _HTMLTextFallbackParser(HTMLParser):
+    _BREAK_TAGS = {
+        "p",
+        "br",
+        "div",
+        "li",
+        "ul",
+        "ol",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "tr",
+        "td",
+        "th",
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in self._BREAK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self._BREAK_TAGS:
+            self.parts.append("\n")
+
+    def as_text(self) -> str:
+        text = "".join(self.parts)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+def extract_html_text(html: str, *, require_trafilatura: bool = False) -> ExtractionResult:
+    trafilatura = None
+    try:
+        import trafilatura as _trafilatura
+    except Exception as exc:  # pragma: no cover - dependency issue
+        if require_trafilatura:
+            raise RuntimeError("trafilatura is required for HTML extraction") from exc
+    else:
+        trafilatura = _trafilatura
+
+    if trafilatura is not None:
+        primary = trafilatura.extract(html, output_format="markdown")
+        if primary and primary.strip():
+            return ExtractionResult(
+                text=primary.strip(),
+                metadata={"mode": "trafilatura_markdown"},
+            )
+
+        fallback = trafilatura.extract(html, output_format="txt", favor_recall=True)
+        if fallback and fallback.strip():
+            return ExtractionResult(
+                text=fallback.strip(),
+                metadata={"mode": "trafilatura_recall"},
+            )
+
+    parser = _HTMLTextFallbackParser()
+    parser.feed(html)
+    plain = parser.as_text()
+    if not plain:
+        return ExtractionResult(text="", metadata={"mode": "empty"})
+    return ExtractionResult(text=plain, metadata={"mode": "html_fallback"})
+
 
 @dataclass(frozen=True)
 class ExtractionResult:
     text: str
     page_texts: list[str] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class ExtractionProvider(Protocol):
     name: str
     version: str
+    supported_mime_types: frozenset[str]
 
-    def extract(self, locator: FileLocator) -> ExtractionResult:
+    def extract(self, locator: FileLocator, *, mime_type: str | None = None) -> ExtractionResult:
         ...
 
     def classify_error(self, exc: Exception) -> ErrorClass:
@@ -36,22 +161,13 @@ class ExtractionProvider(Protocol):
 
 
 @dataclass
-class LocalPdfExtractionProvider:
+class LocalFileExtractionProvider:
     name: str = "local"
-    version: str = "pypdf"
+    version: str = "pypdf+trafilatura"
+    supported_mime_types: frozenset[str] = SUPPORTED_EXTRACTION_MIME_TYPES
 
-    def extract(self, locator: FileLocator) -> ExtractionResult:
+    def _extract_pdf(self, path: Path) -> ExtractionResult:
         from pypdf import PdfReader
-
-        if locator.storage_kind != "local":
-            raise ValueError(f"Unsupported storage kind for local extraction: {locator.storage_kind}")
-        source = locator.file_path or locator.storage_uri
-        if not source:
-            raise FileNotFoundError("No local file path provided")
-
-        path = Path(source).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"File not found: {path}")
 
         reader = PdfReader(str(path))
         pages: list[str] = []
@@ -61,6 +177,21 @@ class LocalPdfExtractionProvider:
 
         return ExtractionResult(text="\n\n".join(pages), page_texts=pages)
 
+    def _extract_html(self, path: Path) -> ExtractionResult:
+        html = path.read_text(encoding="utf-8", errors="ignore")
+        return extract_html_text(html, require_trafilatura=True)
+
+    def extract(self, locator: FileLocator, *, mime_type: str | None = None) -> ExtractionResult:
+        if locator.storage_kind != "local":
+            raise ValueError(f"Unsupported storage kind for local extraction: {locator.storage_kind}")
+        path = _resolve_path(locator)
+        normalized_mime = _normalize_mime_type(mime_type, path)
+        if normalized_mime == PDF_MIME_TYPE:
+            return self._extract_pdf(path)
+        if normalized_mime in HTML_MIME_TYPES:
+            return self._extract_html(path)
+        raise ValueError(f"Unsupported mime type for local extraction: {normalized_mime}")
+
     def classify_error(self, exc: Exception) -> ErrorClass:
         try:
             import requests  # type: ignore
@@ -69,8 +200,10 @@ class LocalPdfExtractionProvider:
 
         if isinstance(exc, FileNotFoundError):
             return "permanent_not_found"
-        if isinstance(exc, ValueError):
+        if isinstance(exc, (ValueError, UnicodeDecodeError)):
             return "permanent_validation"
+        if isinstance(exc, RuntimeError) and "trafilatura" in str(exc).lower():
+            return "permanent_unsupported"
         if requests is not None and isinstance(exc, requests.Timeout):
             return "retryable_timeout"
         if requests is not None and isinstance(exc, requests.RequestException):
@@ -85,18 +218,17 @@ class GeminiExtractionProvider:
     timeout_seconds: int = 300
     name: str = "gemini"
     version: str = "gemini-3-flash-preview"
+    supported_mime_types: frozenset[str] = frozenset({PDF_MIME_TYPE})
 
     def __post_init__(self) -> None:
         import requests  # type: ignore
 
         self._session = requests.Session()
 
-    def _detect_mime(self, path: Path) -> str:
-        guessed, _ = mimetypes.guess_type(path.name)
-        return guessed or "application/pdf"
+    def _detect_mime(self, path: Path, mime_type: str | None = None) -> str:
+        return _normalize_mime_type(mime_type, path)
 
-    def _upload_file(self, path: Path) -> dict:
-        mime_type = self._detect_mime(path)
+    def _upload_file(self, path: Path, mime_type: str) -> dict:
         size = path.stat().st_size
 
         start_res = self._session.post(
@@ -142,29 +274,33 @@ class GeminiExtractionProvider:
         if not res.ok:
             return
 
-    def extract(self, locator: FileLocator) -> ExtractionResult:
-        source = locator.file_path or locator.storage_uri
-        if not source:
-            raise FileNotFoundError("No file path provided")
-        path = Path(source).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"File not found: {path}")
+    def extract(self, locator: FileLocator, *, mime_type: str | None = None) -> ExtractionResult:
+        path = _resolve_path(locator)
+        normalized_mime = self._detect_mime(path, mime_type=mime_type)
+        if normalized_mime not in self.supported_mime_types:
+            raise ValueError(f"Unsupported mime type for gemini extraction: {normalized_mime}")
 
-        file_info = self._upload_file(path)
+        file_info = self._upload_file(path, normalized_mime)
         file_name = file_info.get("name")
         file_uri = file_info.get("uri")
         try:
-            prompt = (
-                "Convert this PDF document to Markdown format. "
-                "Preserve headings, lists, tables, and equations where possible. "
-                "Output only markdown content."
-            )
+            if normalized_mime == PDF_MIME_TYPE:
+                prompt = (
+                    "Convert this PDF document to Markdown format. "
+                    "Preserve headings, lists, tables, and equations where possible. "
+                    "Output only markdown content."
+                )
+            else:
+                prompt = (
+                    "Extract the main textual content from this HTML snapshot and convert it to Markdown. "
+                    "Preserve headings, lists, and tables where possible. Output only markdown content."
+                )
             body = {
                 "contents": [
                     {
                         "role": "user",
                         "parts": [
-                            {"file_data": {"mime_type": "application/pdf", "file_uri": file_uri}},
+                            {"file_data": {"mime_type": normalized_mime, "file_uri": file_uri}},
                             {"text": prompt},
                         ],
                     }
@@ -186,7 +322,10 @@ class GeminiExtractionProvider:
                 raise RuntimeError(f"Gemini returned no candidates: {payload}")
             parts = candidates[0].get("content", {}).get("parts", [])
             text = "\n".join(part.get("text", "") for part in parts if isinstance(part, dict))
-            return ExtractionResult(text=text.strip())
+            return ExtractionResult(
+                text=text.strip(),
+                metadata={"mode": "gemini", "input_mime_type": normalized_mime},
+            )
         finally:
             if file_name:
                 self._delete_file(file_name)
@@ -211,11 +350,20 @@ class GeminiExtractionProvider:
             return "retryable_io"
         return "retryable_io"
 
+# Backward-compatible alias.
+LocalPdfExtractionProvider = LocalFileExtractionProvider
+
 
 __all__ = [
+    "canonicalize_mime_type",
     "ErrorClass",
     "ExtractionProvider",
     "ExtractionResult",
+    "extract_html_text",
+    "HTML_MIME_TYPES",
     "GeminiExtractionProvider",
+    "LocalFileExtractionProvider",
     "LocalPdfExtractionProvider",
+    "PDF_MIME_TYPE",
+    "SUPPORTED_EXTRACTION_MIME_TYPES",
 ]

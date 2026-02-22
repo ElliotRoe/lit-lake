@@ -9,16 +9,19 @@ def get_documentation_text(section: str | None) -> str:
             "Use `sql_search` with `embed()` + `rerank_score()` over `vec_documents` and `documents`.\n\n"
             "## Workflow 2: Citation Assistance\n"
             "Break claims into search statements, retrieve with vector match, rerank, then inspect full text chunks. "
-            "For citations, prefer `documents.page_start/page_end` and use `chunk_index` only as fallback when page metadata is null.\n\n"
+            "For citations, use `json_extract(documents.metadata_json, '$.loc.page_start')` and "
+            "`json_extract(documents.metadata_json, '$.loc.page_end')` when available.\n\n"
             "## Workflow 3: Full Text Verification\n"
-            "Use `document_files.extracted_text` and `documents.kind='pdf_chunk'` for precise evidence checks.\n"
+            "Use `document_files.extracted_text` and `documents.kind='fulltext_chunk'` for precise evidence checks.\n"
+            "Zotero notes and annotations are also searchable via `documents.kind IN ('note','annotation')`.\n"
         )
 
     if section == "schema":
         return (
             "# Schema Overview\n\n"
             "Core tables: `reference_items`, `document_files`, `documents`, `vec_documents`.\n"
-            "Page-aware extraction (best effort, backend-dependent) stores `documents.page_start` and `documents.page_end`.\n"
+            "Chunk- and source-specific metadata is stored in `documents.metadata_json`.\n"
+            "File-level extraction metadata is stored in `document_files.metadata_json`.\n"
             "Queue tables: `jobs`, `job_attempts`, `worker_runs`.\n"
             "Semantic search uses `vec_documents` with `MATCH embed('query') AND k = N`.\n"
         )

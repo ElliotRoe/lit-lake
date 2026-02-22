@@ -32,7 +32,9 @@ from litlake.preview import PdfPreviewRenderer
 from litlake.providers.embedding import FastEmbedEmbeddingProvider, FastEmbedRerankProvider
 from litlake.providers.extraction import (
     GeminiExtractionProvider,
-    LocalPdfExtractionProvider,
+    ExtractionProvider,
+    LocalFileExtractionProvider,
+    SUPPORTED_EXTRACTION_MIME_TYPES,
 )
 from litlake.queue import QueuePolicy
 from litlake.sql_runtime import execute_readonly_query, register_ai_functions
@@ -74,10 +76,15 @@ class AppState:
     extraction_worker: QueueWorker | None
 
 
-def _select_extraction_provider(settings: Settings):
-    if settings.gemini_api_key:
+def _select_extraction_provider(settings: Settings) -> ExtractionProvider:
+    if settings.extraction_backend == "gemini":
+        if not settings.gemini_api_key:
+            raise ValueError(
+                "EXTRACTION_BACKEND=gemini requires GEMINI_API_KEY. "
+                "Set GEMINI_API_KEY or switch EXTRACTION_BACKEND=local."
+            )
         return GeminiExtractionProvider(api_key=settings.gemini_api_key)
-    return LocalPdfExtractionProvider()
+    return LocalFileExtractionProvider()
 
 
 def _select_embedding_provider(settings: Settings):
@@ -90,6 +97,7 @@ def _select_rerank_provider(settings: Settings):
 
 def _background_init(state: AppState) -> None:
     try:
+        extraction_provider = _select_extraction_provider(state.settings)
         with state.conn_lock:
             state.init_message = InitStatus.SYNCING_ZOTERO
             try:
@@ -103,12 +111,19 @@ def _background_init(state: AppState) -> None:
                 logger.warning("Zotero sync failed (continuing): %s", exc)
 
             queue_seed = seed_pending_jobs(
-                state.conn, queue_max_attempts=state.settings.queue_max_attempts
+                state.conn,
+                queue_max_attempts=state.settings.queue_max_attempts,
             )
             logger.info(
                 "Seeded queue jobs: extraction=%s embedding=%s",
                 queue_seed.extraction_jobs_created,
                 queue_seed.embedding_jobs_created,
+            )
+            logger.info(
+                "Extraction backend: %s (%s), mime_types=%s",
+                extraction_provider.name,
+                extraction_provider.version,
+                ",".join(sorted(extraction_provider.supported_mime_types)),
             )
 
             state.init_message = InitStatus.LOADING_EMBED
@@ -139,7 +154,6 @@ def _background_init(state: AppState) -> None:
             state.workers.append(state.embedding_worker)
 
         state.init_message = InitStatus.STARTING_EXTRACT
-        extraction_provider = _select_extraction_provider(state.settings)
         state.extraction_worker = QueueWorker(
             ctx=runtime_ctx,
             handler=ExtractionJobHandler(
@@ -219,10 +233,11 @@ def _state(ctx: Context) -> AppState:
     name="sync_zotero",
     description=(
         "Import/update references from Zotero into the local library. Creates title and "
-        "abstract documents for each reference, which are embedded asynchronously for semantic "
-        "search. Also queues PDF attachments for full-text extraction (local extraction by "
-        "default; Gemini if GEMINI_API_KEY is set). Call this first if the library seems empty "
-        "or out of date."
+        "abstract documents for each reference, ingests supported attachments (PDF + web "
+        "snapshots), and imports Zotero annotations/notes. Text artifacts are embedded "
+        "asynchronously for semantic search, and extractable attachments are queued for full-text "
+        "extraction (local by default; optional Gemini for PDFs). Call this first if the library "
+        "seems empty or out of date."
     ),
     annotations=ToolAnnotations(title="Sync Zotero Library", readOnlyHint=False, destructiveHint=False),
 )
@@ -290,29 +305,34 @@ def get_documentation(section: str | None = None) -> str:
     name="library_status",
     description=(
         "Get an overview of the library: reference counts, document types, embedding status, "
-        "and PDF extraction status. Includes queue and worker diagnostics."
+        "and file extraction status by MIME type. Includes queue and worker diagnostics."
     ),
     annotations=ToolAnnotations(title="Get Library Status", readOnlyHint=True, destructiveHint=False),
 )
 def library_status(ctx: Context) -> str:
     state = _state(ctx)
+    mime_placeholders = ",".join("?" for _ in SUPPORTED_EXTRACTION_MIME_TYPES)
     with state.conn_lock:
         reference_count = state.conn.execute("SELECT COUNT(*) FROM reference_items").fetchone()[0]
         document_count = state.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-        pdf_count = state.conn.execute(
-            "SELECT COUNT(*) FROM document_files WHERE mime_type = 'application/pdf'"
+        file_count = state.conn.execute(
+            "SELECT COUNT(*) FROM document_files"
         ).fetchone()[0]
+        file_rows = state.conn.execute(
+            "SELECT COALESCE(mime_type, 'unknown'), COUNT(*) FROM document_files GROUP BY mime_type"
+        ).fetchall()
 
         embed_rows = state.conn.execute(
             "SELECT kind, embedding_status, COUNT(*) FROM documents GROUP BY kind, embedding_status"
         ).fetchall()
         extraction_rows = state.conn.execute(
-            """
-            SELECT extraction_status, COUNT(*)
+            f"""
+            SELECT COALESCE(mime_type, 'unknown'), extraction_status, COUNT(*)
             FROM document_files
-            WHERE mime_type = 'application/pdf'
-            GROUP BY extraction_status
-            """
+            WHERE mime_type IN ({mime_placeholders})
+            GROUP BY mime_type, extraction_status
+            """,
+            tuple(sorted(SUPPORTED_EXTRACTION_MIME_TYPES)),
         ).fetchall()
 
         embedding: dict[str, dict[str, int]] = {}
@@ -321,9 +341,15 @@ def library_status(ctx: Context) -> str:
             status_key = status or "null"
             embedding.setdefault(kind_key, {})[status_key] = int(count)
 
-        extraction: dict[str, int] = {}
-        for status, count in extraction_rows:
-            extraction[status or "null"] = int(count)
+        extraction: dict[str, dict[str, int]] = {}
+        for mime_type, status, count in extraction_rows:
+            mime_key = mime_type or "unknown"
+            status_key = status or "null"
+            extraction.setdefault(mime_key, {})[status_key] = int(count)
+
+        files_by_mime: dict[str, int] = {}
+        for mime_type, count in file_rows:
+            files_by_mime[mime_type or "unknown"] = int(count)
 
         embed_error_rows = state.conn.execute(
             """
@@ -363,7 +389,8 @@ def library_status(ctx: Context) -> str:
         "summary": {
             "references": int(reference_count),
             "documents": int(document_count),
-            "pdf_files": int(pdf_count),
+            "files": int(file_count),
+            "files_by_mime": files_by_mime,
         },
         "embedding": embedding,
         "extraction": extraction,
@@ -383,7 +410,7 @@ def library_status(ctx: Context) -> str:
     name="preview_document_pdf_pages",
     description=(
         "Render PNG images of PDF pages for VISUAL inspection (figures, tables, layout). "
-        "For programmatic text access, use document_files.extracted_text or query pdf_chunk "
+        "For programmatic text access, use document_files.extracted_text or query fulltext_chunk "
         "documents instead. Requires document_file_id from the document_files table."
     ),
     annotations=ToolAnnotations(title="Preview PDF Pages", readOnlyHint=True, destructiveHint=False),

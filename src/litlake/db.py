@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from litlake.providers.extraction import SUPPORTED_EXTRACTION_MIME_TYPES
+
 
 ISO_NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
@@ -103,10 +105,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             reference_id INTEGER NOT NULL,
             file_path TEXT NOT NULL,
             mime_type TEXT,
-            label TEXT,
             extracted_text TEXT,
             extraction_status TEXT DEFAULT 'pending',
             extraction_error TEXT,
+            metadata_json TEXT,
             source_system TEXT,
             source_id TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -125,6 +127,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             kind TEXT NOT NULL,
             content TEXT,
             chunk_index INTEGER,
+            metadata_json TEXT,
             embedding_status TEXT DEFAULT 'pending',
             embedding_updated_at DATETIME,
             embedding_error TEXT,
@@ -141,8 +144,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     # Add forward-compatible provenance and storage fields.
     _ensure_column(conn, "documents", "embedding_backend", "embedding_backend TEXT")
     _ensure_column(conn, "documents", "embedding_model", "embedding_model TEXT")
-    _ensure_column(conn, "documents", "page_start", "page_start INTEGER")
-    _ensure_column(conn, "documents", "page_end", "page_end INTEGER")
+    _ensure_column(conn, "documents", "metadata_json", "metadata_json TEXT")
 
     _ensure_column(conn, "document_files", "extraction_backend", "extraction_backend TEXT")
     _ensure_column(
@@ -151,6 +153,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         "extraction_backend_version",
         "extraction_backend_version TEXT",
     )
+    _ensure_column(conn, "document_files", "metadata_json", "metadata_json TEXT")
     _ensure_column(conn, "document_files", "storage_kind", "storage_kind TEXT DEFAULT 'local'")
     _ensure_column(conn, "document_files", "storage_uri", "storage_uri TEXT")
 
@@ -315,41 +318,46 @@ def enqueue_job(
 def seed_pending_jobs(conn: sqlite3.Connection, *, queue_max_attempts: int) -> QueueSeedStats:
     stats = QueueSeedStats()
 
+    active_extraction_mimes = tuple(sorted(SUPPORTED_EXTRACTION_MIME_TYPES))
+    placeholders = ",".join("?" for _ in active_extraction_mimes)
     extraction_candidates = conn.execute(
-        """
+        f"""
         SELECT id
         FROM document_files
-        WHERE mime_type = 'application/pdf'
-          AND (
-                extraction_status IN ('pending', 'error')
-                OR extracted_text IS NULL
-              )
+        WHERE mime_type IN ({placeholders})
+          AND extraction_status IN ('pending', 'error')
         """
+        ,
+        active_extraction_mimes,
     ).fetchall()
     for row in extraction_candidates:
         file_id = int(row[0])
         created = enqueue_job(
             conn,
             queue_name="extraction",
-            job_type="extract_pdf",
+            job_type="extract_file",
             entity_type="document_file",
             entity_id=file_id,
-            dedupe_key=f"extract_pdf:{file_id}",
+            dedupe_key=f"extract_file:{file_id}",
             payload={"document_file_id": file_id},
             max_attempts=queue_max_attempts,
         )
         if created:
             stats.extraction_jobs_created += 1
 
+    embeddable_kinds = ("title", "abstract", "fulltext_chunk", "annotation", "note")
+    emb_kind_placeholders = ",".join("?" for _ in embeddable_kinds)
     embedding_candidates = conn.execute(
-        """
+        f"""
         SELECT id
         FROM documents
-        WHERE kind IN ('title','abstract','pdf_chunk')
+        WHERE kind IN ({emb_kind_placeholders})
           AND content IS NOT NULL
           AND TRIM(content) <> ''
           AND embedding_status IN ('pending','error')
         """
+        ,
+        embeddable_kinds,
     ).fetchall()
     for row in embedding_candidates:
         doc_id = int(row[0])

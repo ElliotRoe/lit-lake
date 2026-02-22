@@ -56,10 +56,10 @@ class QueueEngineTests(unittest.TestCase):
         enqueue_job(
             self.conn,
             queue_name="extraction",
-            job_type="extract_pdf",
+            job_type="extract_file",
             entity_type="document_file",
             entity_id=4,
-            dedupe_key="extract_pdf:4",
+            dedupe_key="extract_file:4",
             max_attempts=1,
         )
         claimed = self.engine.claim("extraction")
@@ -117,10 +117,10 @@ class QueueEngineTests(unittest.TestCase):
         enqueue_job(
             self.conn,
             queue_name="extraction",
-            job_type="extract_pdf",
+            job_type="extract_file",
             entity_type="document_file",
             entity_id=10,
-            dedupe_key="extract_pdf:10",
+            dedupe_key="extract_file:10",
         )
         claimed = self.engine.claim("extraction")
         self.assertEqual(len(claimed), 1)
