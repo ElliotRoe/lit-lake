@@ -3,10 +3,13 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import sqlite3
+import sys
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncIterator, cast
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -229,6 +232,19 @@ def _state(ctx: Context) -> AppState:
     return cast(AppState, lifespan_state)
 
 
+def _resolve_debug_log_path() -> Path | None:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Logs" / "Claude" / "mcp-server-lit-lake.log"
+
+    if sys.platform.startswith("win"):
+        appdata = os.getenv("APPDATA")
+        if not appdata:
+            return None
+        return Path(appdata) / "Claude" / "logs" / "mcp-server-lit-lake.log"
+
+    return None
+
+
 @mcp.tool(
     name="sync_zotero",
     description=(
@@ -402,6 +418,52 @@ def library_status(ctx: Context) -> str:
             "recent_attempts": attempt_errors,
             "dead_jobs": dead_jobs,
         },
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="get_debug_log_path",
+    description=(
+        "Return the expected Claude Desktop log file path for Lit Lake and whether the file exists. "
+        "Use this when users need to send logs for debugging."
+    ),
+    annotations=ToolAnnotations(title="Get Debug Log Path", readOnlyHint=True, destructiveHint=False),
+)
+def get_debug_log_path() -> str:
+    log_path = _resolve_debug_log_path()
+    if log_path is None:
+        payload = {
+            "path": None,
+            "exists": False,
+            "browser_url_markdown": None,
+            "message": (
+                "Could not determine Claude Desktop log path on this platform. "
+                "Lit Lake currently supports this helper on macOS and Windows."
+            ),
+        }
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    browser_url = log_path.as_uri()
+    browser_url_markdown = f"```text\n{browser_url}\n```"
+    exists = log_path.is_file()
+    message = (
+        "Send this file when reporting Lit Lake issues. "
+        "To open it quickly, copy and paste this into your browser:\n"
+        f"{browser_url_markdown}"
+        if exists
+        else (
+            "Expected Lit Lake log file was not found at this path. "
+            "When available, you can open it by copying and pasting this into your browser:\n"
+            f"{browser_url_markdown}"
+        )
+    )
+    payload = {
+        "path": str(log_path),
+        "browser_url": browser_url,
+        "browser_url_markdown": browser_url_markdown,
+        "exists": exists,
+        "message": message,
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
