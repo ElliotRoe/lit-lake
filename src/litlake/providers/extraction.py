@@ -62,6 +62,16 @@ def _normalize_mime_type(mime_type: str | None, path: Path) -> str:
     raise ValueError(f"Unsupported mime type for extraction: {normalized or 'unknown'}")
 
 
+def _looks_like_full_html_document(html: str) -> bool:
+    snippet = html.lstrip().lower()
+    if not snippet:
+        return False
+    if snippet.startswith("<!doctype html") or snippet.startswith("<html") or snippet.startswith("<?xml"):
+        return True
+    head = snippet[:2048]
+    return "<html" in head and ("<body" in head or "</html>" in head)
+
+
 class _HTMLTextFallbackParser(HTMLParser):
     _BREAK_TAGS = {
         "p",
@@ -109,14 +119,16 @@ class _HTMLTextFallbackParser(HTMLParser):
 
 
 def extract_html_text(html: str, *, require_trafilatura: bool = False) -> ExtractionResult:
+    should_try_trafilatura = require_trafilatura or _looks_like_full_html_document(html)
     trafilatura = None
-    try:
-        import trafilatura as _trafilatura
-    except Exception as exc:  # pragma: no cover - dependency issue
-        if require_trafilatura:
-            raise RuntimeError("trafilatura is required for HTML extraction") from exc
-    else:
-        trafilatura = _trafilatura
+    if should_try_trafilatura:
+        try:
+            import trafilatura as _trafilatura
+        except Exception as exc:  # pragma: no cover - dependency issue
+            if require_trafilatura:
+                raise RuntimeError("trafilatura is required for HTML extraction") from exc
+        else:
+            trafilatura = _trafilatura
 
     if trafilatura is not None:
         primary = trafilatura.extract(html, output_format="markdown")
@@ -163,17 +175,20 @@ class ExtractionProvider(Protocol):
 @dataclass
 class LocalFileExtractionProvider:
     name: str = "local"
-    version: str = "pypdf+trafilatura"
+    version: str = "pymupdf+trafilatura"
     supported_mime_types: frozenset[str] = SUPPORTED_EXTRACTION_MIME_TYPES
 
     def _extract_pdf(self, path: Path) -> ExtractionResult:
-        from pypdf import PdfReader
+        import fitz  # pymupdf
 
-        reader = PdfReader(str(path))
+        doc = fitz.open(str(path))
         pages: list[str] = []
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            pages.append(text)
+        try:
+            for page in doc:
+                text = page.get_text("text") or ""
+                pages.append(text)
+        finally:
+            doc.close()
 
         return ExtractionResult(text="\n\n".join(pages), page_texts=pages)
 

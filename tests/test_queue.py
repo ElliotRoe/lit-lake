@@ -146,6 +146,64 @@ class QueueEngineTests(unittest.TestCase):
         self.assertIsNone(row[1])
         self.assertIsNone(row[2])
 
+    def test_claim_skips_job_at_attempt_limit(self) -> None:
+        enqueue_job(
+            self.conn,
+            queue_name="embedding",
+            job_type="embed_document",
+            entity_type="document",
+            entity_id=99,
+            dedupe_key="embed_document:99",
+            max_attempts=1,
+        )
+        self.conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'retry',
+                attempts = 1,
+                available_at = CURRENT_TIMESTAMP
+            WHERE dedupe_key = 'embed_document:99'
+            """
+        )
+        self.conn.commit()
+
+        claimed = self.engine.claim("embedding")
+        self.assertEqual(len(claimed), 0)
+
+    def test_reclaim_expired_claim_marks_dead_at_attempt_limit(self) -> None:
+        enqueue_job(
+            self.conn,
+            queue_name="extraction",
+            job_type="extract_file",
+            entity_type="document_file",
+            entity_id=11,
+            dedupe_key="extract_file:11",
+            max_attempts=1,
+        )
+        claimed = self.engine.claim("extraction")
+        self.assertEqual(len(claimed), 1)
+        job = claimed[0]
+
+        self.conn.execute(
+            """
+            UPDATE jobs
+            SET claim_expires_at = datetime('now', '-1 minute')
+            WHERE id = ?
+            """,
+            (job.job_id,),
+        )
+        self.conn.commit()
+
+        reclaimed = self.engine.reclaim_expired_claims("extraction")
+        self.assertEqual(reclaimed, 1)
+        row = self.conn.execute(
+            "SELECT status, claimed_by, claim_token FROM jobs WHERE id = ?",
+            (job.job_id,),
+        ).fetchone()
+        self.assertEqual(row[0], "dead")
+        self.assertIsNone(row[1])
+        self.assertIsNone(row[2])
+
 
 if __name__ == "__main__":
     unittest.main()

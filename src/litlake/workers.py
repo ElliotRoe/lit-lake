@@ -84,20 +84,22 @@ class QueueWorker(threading.Thread):
     def wake(self) -> None:
         self.wake_event.set()
 
-    def _open(self) -> tuple[sqlite3.Connection, QueueEngine]:
-        conn = connect_db(self.ctx.settings.paths.db_path)
-        queue_engine = QueueEngine(conn, self.worker_instance_id, self.ctx.queue_policy)
-        queue_engine.record_worker_started(
+    def _open(self) -> tuple[sqlite3.Connection, QueueEngine, sqlite3.Connection, QueueEngine]:
+        job_conn = connect_db(self.ctx.settings.paths.db_path)
+        job_queue_engine = QueueEngine(job_conn, self.worker_instance_id, self.ctx.queue_policy)
+        job_queue_engine.record_worker_started(
             worker_type=self.handler.worker_type,
             backend_name=self.handler.provider_name,
             backend_version=self.handler.provider_version,
             config_hash=self.ctx.settings.queue_config_hash,
         )
-        return conn, queue_engine
+        lease_conn = connect_db(self.ctx.settings.paths.db_path)
+        lease_queue_engine = QueueEngine(lease_conn, self.worker_instance_id, self.ctx.queue_policy)
+        return job_conn, job_queue_engine, lease_conn, lease_queue_engine
 
     def _run_with_lease_renewal(
         self,
-        queue_engine: QueueEngine,
+        lease_queue_engine: QueueEngine,
         job: ClaimedJob,
         fn,
     ) -> None:
@@ -108,7 +110,7 @@ class QueueWorker(threading.Thread):
             while not renew_stop.wait(timeout=interval):
                 if self.stop_event.is_set():
                     return
-                if not queue_engine.renew_lease(job):
+                if not lease_queue_engine.renew_lease(job):
                     return
 
         renewer = threading.Thread(
@@ -124,12 +126,12 @@ class QueueWorker(threading.Thread):
             renewer.join(timeout=1.0)
 
     def run(self) -> None:  # pragma: no cover - integration behavior
-        conn, queue_engine = self._open()
+        job_conn, job_queue_engine, lease_conn, lease_queue_engine = self._open()
         try:
             while not self.stop_event.is_set():
-                queue_engine.heartbeat()
-                queue_engine.reclaim_expired_claims(self.handler.queue_name)
-                claimed = queue_engine.claim(self.handler.queue_name)
+                job_queue_engine.heartbeat()
+                job_queue_engine.reclaim_expired_claims(self.handler.queue_name)
+                claimed = job_queue_engine.claim(self.handler.queue_name)
                 if not claimed:
                     self.wake_event.wait(timeout=self.handler.idle_wait_seconds)
                     self.wake_event.clear()
@@ -139,18 +141,24 @@ class QueueWorker(threading.Thread):
                     if self.stop_event.is_set():
                         break
                     self._run_with_lease_renewal(
-                        queue_engine,
+                        lease_queue_engine,
                         job,
-                        lambda: self.handler.handle_claimed_job(conn, queue_engine, job, self.ctx),
+                        lambda: self.handler.handle_claimed_job(
+                            job_conn,
+                            job_queue_engine,
+                            job,
+                            self.ctx,
+                        ),
                     )
 
-            queue_engine.stop_worker("stopped")
+            job_queue_engine.stop_worker("stopped")
         except Exception as exc:  # noqa: BLE001
             self.error = exc
             logger.exception("%s worker failed", self.handler.worker_type)
-            queue_engine.stop_worker("failed")
+            job_queue_engine.stop_worker("failed")
         finally:
-            conn.close()
+            job_conn.close()
+            lease_conn.close()
 
 
 class EmbeddingJobHandler:

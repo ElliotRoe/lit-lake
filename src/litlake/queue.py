@@ -116,7 +116,7 @@ class QueueEngine:
         self.conn.commit()
 
     def reclaim_expired_claims(self, queue_name: str) -> int:
-        cur = self.conn.execute(
+        retry_cur = self.conn.execute(
             """
             UPDATE jobs
             SET status = 'retry',
@@ -128,11 +128,29 @@ class QueueEngine:
               AND status = 'claimed'
               AND claim_expires_at IS NOT NULL
               AND datetime(claim_expires_at) <= CURRENT_TIMESTAMP
+              AND attempts < max_attempts
+              AND attempts < ?
             """,
-            (queue_name,),
+            (queue_name, self.policy.max_attempts),
+        )
+        dead_cur = self.conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'dead',
+                claimed_by = NULL,
+                claim_token = NULL,
+                claim_expires_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE queue_name = ?
+              AND status = 'claimed'
+              AND claim_expires_at IS NOT NULL
+              AND datetime(claim_expires_at) <= CURRENT_TIMESTAMP
+              AND (attempts >= max_attempts OR attempts >= ?)
+            """,
+            (queue_name, self.policy.max_attempts),
         )
         self.conn.commit()
-        return cur.rowcount
+        return retry_cur.rowcount + dead_cur.rowcount
 
     def claim(self, queue_name: str) -> list[ClaimedJob]:
         now = self._now()
@@ -145,10 +163,12 @@ class QueueEngine:
             WHERE queue_name = ?
               AND status IN ('queued','retry')
               AND datetime(available_at) <= CURRENT_TIMESTAMP
+              AND attempts < max_attempts
+              AND attempts < ?
             ORDER BY priority ASC, created_at ASC
             LIMIT ?
             """,
-            (queue_name, self.policy.batch_size),
+            (queue_name, self.policy.max_attempts, self.policy.batch_size),
         ).fetchall()
 
         claimed: list[ClaimedJob] = []
@@ -169,12 +189,15 @@ class QueueEngine:
                 WHERE id = ?
                   AND status IN ('queued','retry')
                   AND datetime(available_at) <= CURRENT_TIMESTAMP
+                  AND attempts < max_attempts
+                  AND attempts < ?
                 """,
                 (
                     self.worker_id,
                     claim_token,
                     self._iso(expiry),
                     row[0],
+                    self.policy.max_attempts,
                 ),
             )
             if updated.rowcount != 1:

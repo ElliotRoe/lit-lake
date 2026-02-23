@@ -5,8 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pypdf import PdfWriter
-from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+import fitz  # pymupdf
 
 
 MB = 1024 * 1024
@@ -20,16 +19,6 @@ class PdfFixtureSpec:
     min_size_bytes: int
 
 
-def _escape_pdf_text(text: str) -> str:
-    return (
-        text.replace("\\", "\\\\")
-        .replace("(", "\\(")
-        .replace(")", "\\)")
-        .replace("\n", " ")
-        .strip()
-    )
-
-
 def create_valid_pdf(
     path: Path,
     *,
@@ -39,35 +28,20 @@ def create_valid_pdf(
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    writer = PdfWriter()
-    font_obj = writer._add_object(  # type: ignore[attr-defined]
-        DictionaryObject(
-            {
-                NameObject("/Type"): NameObject("/Font"),
-                NameObject("/Subtype"): NameObject("/Type1"),
-                NameObject("/BaseFont"): NameObject("/Helvetica"),
-            }
-        )
-    )
-
-    for idx in range(max(1, pages)):
-        page = writer.add_blank_page(width=612, height=792)
-        resources = DictionaryObject(
-            {
-                NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_obj}),
-            }
-        )
-        page[NameObject("/Resources")] = resources
-
-        escaped = _escape_pdf_text(
-            f"{text_seed} page={idx + 1} " + ("lorem ipsum " * 64)
-        )
-        stream = DecodedStreamObject()
-        stream.set_data(f"BT /F1 11 Tf 72 720 Td ({escaped}) Tj ET".encode("latin-1", "replace"))
-        page[NameObject("/Contents")] = writer._add_object(stream)  # type: ignore[attr-defined]
-
-    with path.open("wb") as handle:
-        writer.write(handle)
+    doc = fitz.open()
+    try:
+        for idx in range(max(1, pages)):
+            page = doc.new_page(width=612, height=792)
+            text = f"{text_seed} page={idx + 1} " + ("lorem ipsum " * 64)
+            page.insert_textbox(
+                fitz.Rect(72, 72, 540, 760),
+                text,
+                fontname="helv",
+                fontsize=11,
+            )
+        doc.save(str(path))
+    finally:
+        doc.close()
 
     if min_size_bytes > 0:
         pad_pdf_to_size(path, min_size_bytes)
@@ -150,4 +124,3 @@ def build_stall_regression_fixture_set(
 
 def should_run_true_large_fixture() -> bool:
     return os.getenv("LIT_LAKE_RUN_LARGE_FIXTURES", "").lower() in {"1", "true", "yes", "on"}
-
