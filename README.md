@@ -3,6 +3,8 @@
 > ⚠️ **UNDER CONSTRUCTION** ⚠️  
 > This project (and the README itself for that matter) is actively being developed. Features may be incomplete, documentation may be outdated, and breaking changes may occur. Use at your own risk and check back for updates!
 
+> Runtime update: Lit Lake now includes a Python + UV MCPB server implementation with durable queue/audit tables (`jobs`, `job_attempts`, `worker_runs`).
+
 Connect [Claude](https://www.anthropic.com/claude) (and others) to [Zotero](https://www.zotero.org/) with one click. Discover related papers through semantic search, analyze references with full context and allow Claude to access the full text (including embedded images) of your library.
 
 ## Installation
@@ -28,6 +30,7 @@ During installation, you can configure the following options. All are **optional
 |--------|-------------|---------|
 | **Zotero DB** | Path to your `zotero.sqlite` file | `~/Zotero/zotero.sqlite` |
 | **Lit Lake Folder** | Parent folder where the `LitLake` data directory will be created | `~/LitLake` |
+| **Extraction Backend** | Chooses extraction backend (`local` or `gemini`) | `local` |
 | **Gemini API Key** | Enables higher-quality PDF extraction via Gemini | Local extraction (no API needed) |
 | **Disable Embedding** | Turns off background embedding processes to save battery | Off (embedding runs) |
 
@@ -37,7 +40,9 @@ During installation, you can configure the following options. All are **optional
 
 **Lit Lake Folder**: If you select a folder that is not named `LitLake`, the app will create a `LitLake` subdirectory inside it. This is where your database and AI models are stored.
 
-**Gemini API Key**: PDF text extraction works out of the box using a local pure-Rust extractor. If you provide a [Google AI Studio](https://aistudio.google.com/) API key, Lit Lake will use Gemini instead, which often produces cleaner, more structured output.
+**Extraction Backend**: Set `EXTRACTION_BACKEND=local` (default) or `EXTRACTION_BACKEND=gemini`. Lit Lake uses one backend per run and does not mix backends.
+
+**Gemini API Key**: Required only when `EXTRACTION_BACKEND=gemini`. If set, Lit Lake uses Gemini for PDF extraction.
 
 **Disable Embedding**: Enable this option to stop background embedding processes. Useful when you're on battery power and want to conserve energy. Note: semantic search won't work for new documents until embeddings are generated.
 
@@ -45,29 +50,36 @@ During installation, you can configure the following options. All are **optional
 On first launch, Lit Lake will:
 1. **Automatically sync your Zotero library** — no manual action needed
 2. **Download AI models** (~500MB total) — this happens once and may take a few minutes
-3. **Begin extracting PDF text** — runs in the background, progress visible via `library_status`
+3. **Begin extracting full text from supported attachments** — runs in the background, progress visible via `library_status`
 
 You can check progress by asking Claude to call `library_status`. Once `init_status` shows "Ready", semantic search is available.
 
 > **Note**: If you enabled "Disable Embedding" for battery savings, semantic search won't work until you disable that option and let the embedding process run.
 
-#### PDF Full-Text Extraction
-Lit Lake automatically extracts text from your PDF attachments so Claude can search and analyze full papers — not just titles and abstracts.
+#### Attachment Full-Text Extraction
+Lit Lake automatically extracts text from supported attachment types (including PDF and HTML web snapshots) so Claude can search and analyze full papers and saved webpages — not just titles and abstracts.
 
 **How it works:**
-- **By default**, Lit Lake uses a local pure-Rust extractor (`pdf-extract`). No API keys required, works offline, and keeps the binary fully self-contained.
-- **With Gemini API key**, extraction uses Google's Gemini model, which often produces cleaner markdown with better structure preservation.
+- **By default**, Lit Lake uses local extraction (`pymupdf` for PDFs + `trafilatura` for HTML snapshots). No API keys required.
+- **With `EXTRACTION_BACKEND=gemini`**, extraction uses Google's Gemini model for PDFs.
 
 **What happens during extraction:**
-1. Text is extracted from each PDF attachment
+1. Text is extracted from each supported attachment
 2. Raw text is normalized (line wraps and hyphenation fixed) to improve quality
 3. Full text is stored in the database for direct access
 4. Text is split into searchable chunks with embeddings for semantic search
+5. When available, location metadata (like PDF page ranges) is stored in `documents.metadata_json` for citation-friendly references
 
 Check extraction progress via `library_status` — look for the `extraction` status counts.
+Location metadata is optional and backend-dependent. Backends that do not return it leave `metadata_json.loc` empty.
 
 ### Other LLMs
 To use Lit Lake with other LLM clients (like LM Studio, Cherry studio, etc), you'll just need to download the binary file and make it executable then configure it globally. Honestly, I haven't configured it yet with another client, if you are attempting, please reach out and I can help, then I'll add the instructions back here.
+
+## Queue Maintenance
+
+- `uv run lit-lake-queue stats`  
+  Shows durable queue depth by queue/state.
 ## Use Cases
 
 #### Paper Discovery & Search 
@@ -85,7 +97,7 @@ The search ability is great for discovering individual or groups of papers based
 > "Find me all articles that have keywords 'pedagogical content knowledge' or 'PCK' within their abstract and are related to out of field teaching or teaching self-efficacy."
 
 #### Full-Text Analysis
-With PDF extraction enabled, Claude can access and analyze the complete content of your papers — not just titles and abstracts. This is invaluable for verification, deep research, and finding specific passages.
+With attachment extraction enabled, Claude can access and analyze the complete content of your papers and snapshots — not just titles and abstracts. This is invaluable for verification, deep research, and finding specific passages.
 
 *Examples*
 

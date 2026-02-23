@@ -1,5 +1,5 @@
 {
-  "manifest_version": "0.2",
+  "manifest_version": "0.4",
   "name": "lit-lake",
   "version": "0.1.0",
   "description": "A MCP to connect your reference managers to Claude",
@@ -8,21 +8,16 @@
     "url": "https://github.com/ElliotRoe"
   },
   "server": {
-    "type": "binary",
-    "entry_point": "lit-lake-mcp",
+    "type": "uv",
+    "entry_point": "src/litlake/server.py",
     "mcp_config": {
-      "command": "${__dirname}/lit-lake-mcp",
-      "args": [],
+      "command": "uv",
+      "args": ["run", "lit-lake-mcp"],
       "env": {
         "EMBED_DISABLED": "${user_config.disable_embedding}",
         "ZOTERO_DB_PATH": "${user_config.z_db}",
         "LIT_LAKE_PATH": "${user_config.lit_lake_folder}",
         "GEMINI_API_KEY": "${user_config.gemini_api_key}"
-      },
-      "platform_overrides": {
-        "win32": {
-          "command": "${__dirname}/lit-lake-mcp.exe"
-        }
       }
     }
   },
@@ -30,28 +25,28 @@
     "disable_embedding": {
       "type": "boolean",
       "title": "Disable Embedding",
-      "description": "Used to disable the embedding background processes for Lit Lake. Useful to enable when battery life is a concern",
+      "description": "Disable embedding background worker to save resources.",
       "required": false,
       "sensitive": false
     },
     "z_db": {
       "type": "file",
       "title": "Zotero DB",
-      "description": "The path to the Zotero db file (Optional: defaults to ~/Zotero/zotero.sqlite)",
+      "description": "Path to Zotero sqlite DB (optional: defaults to ~/Zotero/zotero.sqlite)",
       "required": false,
       "sensitive": false
     },
     "lit_lake_folder": {
       "type": "directory",
       "title": "Lit Lake Folder",
-      "description": "The parent folder in which the 'LitLake' data folder should be created within (Optional: defaults to ~/LitLake)",
+      "description": "Parent folder where LitLake data directory will be created.",
       "required": false,
       "sensitive": false
     },
     "gemini_api_key": {
       "type": "string",
       "title": "Gemini API Key",
-      "description": "Optional. If set, PDFs are extracted with Gemini. Otherwise Lit Lake uses local extract-pdf.",
+      "description": "Optional API key for Gemini PDF conversion. If omitted, local PDF conversion is used.",
       "required": false,
       "sensitive": true
     }
