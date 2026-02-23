@@ -32,6 +32,7 @@ jobs:
       - name: Pack .mcpb (validated)
         shell: bash
         run: |
+          find . -maxdepth 1 -type f -name "*.mcpb" -print -delete
           npx -y @anthropic-ai/mcpb pack
 
       - name: Normalize output filename
@@ -43,8 +44,12 @@ jobs:
 
           tag = os.environ.get("GITHUB_REF_NAME", "dev")
           outs = sorted(Path(".").glob("*.mcpb"))
-          if not outs:
-            raise SystemExit("mcpb pack did not produce a .mcpb file in repository root")
+          if len(outs) != 1:
+            names = ", ".join(path.name for path in outs) if outs else "(none)"
+            raise SystemExit(
+                "expected exactly one freshly built .mcpb in repository root; found: "
+                + names
+            )
 
           src = outs[0]
           dst = Path(f"lit-lake-{tag}.mcpb")
