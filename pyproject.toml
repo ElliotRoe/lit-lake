@@ -12,7 +12,6 @@ dependencies = [
   "requests>=2.32.3,<3",
   "sqlite-vec>=0.1.6,<0.2",
   "fastembed>=0.7.0,<1",
-  "pypdf>=5.0.0,<6",
   "pymupdf>=1.25.0,<2",
   "trafilatura>=2.0.0,<3",
 ]
