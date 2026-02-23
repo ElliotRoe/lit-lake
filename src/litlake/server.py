@@ -31,6 +31,7 @@ from litlake.db import (
     seed_pending_jobs,
 )
 from litlake.docs import get_documentation_text
+from litlake.migration import auto_migrate_if_needed
 from litlake.preview import PdfPreviewRenderer
 from litlake.providers.embedding import FastEmbedEmbeddingProvider, FastEmbedRerankProvider
 from litlake.providers.extraction import (
@@ -184,6 +185,20 @@ def _background_init(state: AppState) -> None:
 def _build_state(settings: Settings) -> AppState:
     conn = connect_db(settings.paths.db_path)
     init_db(conn)
+    reasons, migration_report = auto_migrate_if_needed(
+        conn,
+        queue_max_attempts=settings.queue_max_attempts,
+        seed_jobs=False,
+    )
+    if migration_report is not None:
+        logger.info(
+            "Auto-migration applied (%d checks): renamed_pdf_chunks=%d storage_uri_backfilled=%d",
+            len(reasons),
+            migration_report.renamed_pdf_chunks,
+            migration_report.storage_uri_backfilled,
+        )
+        for reason in reasons:
+            logger.info("Auto-migration reason: %s", reason)
     return AppState(
         settings=settings,
         conn=conn,

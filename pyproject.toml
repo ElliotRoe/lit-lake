@@ -19,6 +19,7 @@ dependencies = [
 [project.scripts]
 lit-lake-mcp = "litlake.server:main"
 lit-lake-queue = "litlake.maintenance:main"
+lit-lake-migrate = "litlake.migration:main"
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
