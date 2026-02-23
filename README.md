@@ -60,7 +60,7 @@ You can check progress by asking Claude to call `library_status`. Once `init_sta
 Lit Lake automatically extracts text from supported attachment types (including PDF and HTML web snapshots) so Claude can search and analyze full papers and saved webpages — not just titles and abstracts.
 
 **How it works:**
-- **By default**, Lit Lake uses local extraction (`pypdf` for PDFs + `trafilatura` for HTML snapshots). No API keys required.
+- **By default**, Lit Lake uses local extraction (`pymupdf` for PDFs + `trafilatura` for HTML snapshots). No API keys required.
 - **With `EXTRACTION_BACKEND=gemini`**, extraction uses Google's Gemini model for PDFs.
 
 **What happens during extraction:**
