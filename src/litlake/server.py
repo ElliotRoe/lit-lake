@@ -31,6 +31,7 @@ from litlake.db import (
     seed_pending_jobs,
 )
 from litlake.docs import get_documentation_text
+from litlake.logging_utils import configure_litlake_logging
 from litlake.migration import auto_migrate_if_needed
 from litlake.preview import PdfPreviewRenderer
 from litlake.providers.embedding import FastEmbedEmbeddingProvider, FastEmbedRerankProvider
@@ -52,10 +53,6 @@ from litlake.workers import (
 )
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
 logger = logging.getLogger("litlake")
 
 
@@ -224,8 +221,10 @@ def _shutdown(state: AppState) -> None:
 async def app_lifespan(_mcp: FastMCP) -> AsyncIterator[AppState]:
     load_dotenv()
     settings = load_settings()
+    log_path = configure_litlake_logging(settings.paths.root / "logs" / "lit-lake.log")
     state = _build_state(settings)
 
+    logger.info("Using Lit Lake log file: %s", log_path)
     logger.info("Using database: %s", settings.paths.db_path)
     logger.info("Using models directory: %s", settings.paths.models_path)
 
@@ -247,7 +246,12 @@ def _state(ctx: Context) -> AppState:
     return cast(AppState, lifespan_state)
 
 
-def _resolve_debug_log_path() -> Path | None:
+def _resolve_debug_log_path() -> Path:
+    settings = load_settings()
+    return settings.paths.root / "logs" / "lit-lake.log"
+
+
+def _resolve_claude_mcp_log_path() -> Path | None:
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Logs" / "Claude" / "mcp-server-lit-lake.log"
 
@@ -440,44 +444,59 @@ def library_status(ctx: Context) -> str:
 @mcp.tool(
     name="get_debug_log_path",
     description=(
-        "Return the expected Claude Desktop log file path for Lit Lake and whether the file exists. "
+        "Return Lit Lake and Claude MCP log file paths and whether each exists. "
         "Use this when users need to send logs for debugging."
     ),
     annotations=ToolAnnotations(title="Get Debug Log Path", readOnlyHint=True, destructiveHint=False),
 )
 def get_debug_log_path() -> str:
-    log_path = _resolve_debug_log_path()
-    if log_path is None:
-        payload = {
-            "path": None,
-            "exists": False,
-            "browser_url_markdown": None,
-            "message": (
-                "Could not determine Claude Desktop log path on this platform. "
-                "Lit Lake currently supports this helper on macOS and Windows."
-            ),
-        }
-        return json.dumps(payload, indent=2, ensure_ascii=False)
+    litlake_path = _resolve_debug_log_path()
+    litlake_browser_url = litlake_path.as_uri()
+    litlake_browser_url_markdown = f"```text\n{litlake_browser_url}\n```"
+    litlake_exists = litlake_path.is_file()
 
-    browser_url = log_path.as_uri()
-    browser_url_markdown = f"```text\n{browser_url}\n```"
-    exists = log_path.is_file()
+    claude_path = _resolve_claude_mcp_log_path()
+    claude_browser_url = claude_path.as_uri() if claude_path else None
+    claude_browser_url_markdown = (
+        f"```text\n{claude_browser_url}\n```" if claude_browser_url is not None else None
+    )
+    claude_exists = claude_path.is_file() if claude_path is not None else False
+
+    claude_text = (
+        f"Claude MCP log path: {claude_browser_url_markdown}"
+        if claude_browser_url_markdown
+        else "Claude MCP log path is not available on this platform."
+    )
     message = (
-        "Send this file when reporting Lit Lake issues. "
-        "To open it quickly, copy and paste this into your browser:\n"
-        f"{browser_url_markdown}"
-        if exists
+        "Send these logs when reporting Lit Lake issues.\n"
+        "Lit Lake log path:\n"
+        f"{litlake_browser_url_markdown}\n"
+        f"{claude_text}"
+        if litlake_exists
         else (
             "Expected Lit Lake log file was not found at this path. "
             "When available, you can open it by copying and pasting this into your browser:\n"
-            f"{browser_url_markdown}"
+            f"{litlake_browser_url_markdown}\n"
+            f"{claude_text}"
         )
     )
     payload = {
-        "path": str(log_path),
-        "browser_url": browser_url,
-        "browser_url_markdown": browser_url_markdown,
-        "exists": exists,
+        "path": str(litlake_path),
+        "browser_url": litlake_browser_url,
+        "browser_url_markdown": litlake_browser_url_markdown,
+        "exists": litlake_exists,
+        "lit_lake_log": {
+            "path": str(litlake_path),
+            "browser_url": litlake_browser_url,
+            "browser_url_markdown": litlake_browser_url_markdown,
+            "exists": litlake_exists,
+        },
+        "claude_mcp_log": {
+            "path": str(claude_path) if claude_path is not None else None,
+            "browser_url": claude_browser_url,
+            "browser_url_markdown": claude_browser_url_markdown,
+            "exists": claude_exists,
+        },
         "message": message,
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
