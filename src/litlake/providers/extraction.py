@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import re
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from litlake.pdf_runtime import capture_mupdf_diagnostics
 from litlake.storage import FileLocator
 
 ErrorClass = Literal[
@@ -22,6 +24,7 @@ ErrorClass = Literal[
 PDF_MIME_TYPE = "application/pdf"
 HTML_MIME_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 SUPPORTED_EXTRACTION_MIME_TYPES = frozenset({PDF_MIME_TYPE, *HTML_MIME_TYPES})
+logger = logging.getLogger(__name__)
 
 
 def canonicalize_mime_type(mime_type: str | None) -> str | None:
@@ -181,14 +184,15 @@ class LocalFileExtractionProvider:
     def _extract_pdf(self, path: Path) -> ExtractionResult:
         import fitz  # pymupdf
 
-        doc = fitz.open(str(path))
         pages: list[str] = []
-        try:
-            for page in doc:
-                text = page.get_text("text") or ""
-                pages.append(text)
-        finally:
-            doc.close()
+        with capture_mupdf_diagnostics(f"extract:{path}", log=logger):
+            doc = fitz.open(str(path))
+            try:
+                for page in doc:
+                    text = page.get_text("text") or ""
+                    pages.append(text)
+            finally:
+                doc.close()
 
         return ExtractionResult(text="\n\n".join(pages), page_texts=pages)
 
