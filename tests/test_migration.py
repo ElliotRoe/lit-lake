@@ -6,7 +6,11 @@ import unittest
 from pathlib import Path
 
 from litlake.db import connect_db, init_db
-from litlake.migration import auto_migrate_if_needed, migrate_database
+from litlake.migration import (
+    LEGACY_EMPTY_CHUNK_REPAIR_ERROR,
+    auto_migrate_if_needed,
+    migrate_database,
+)
 
 
 def _create_legacy_db(path: Path) -> None:
@@ -201,6 +205,60 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(report.renamed_pdf_chunks, 2)
             self.assertEqual(report.queue_seed_embedding_jobs, 0)
             self.assertEqual(report.queue_seed_extraction_jobs, 0)
+
+            reasons_second, report_second = auto_migrate_if_needed(
+                conn,
+                queue_max_attempts=4,
+                seed_jobs=False,
+            )
+            self.assertEqual(reasons_second, [])
+            self.assertIsNone(report_second)
+        finally:
+            conn.close()
+
+    def test_auto_migrate_repairs_pending_empty_fulltext_chunks(self) -> None:
+        db_path = Path(self.tmp.name) / "stuck-empty-chunk.db"
+        conn = connect_db(db_path)
+        try:
+            init_db(conn)
+            ref_id = conn.execute(
+                """
+                INSERT INTO reference_items(source_system, source_id, title)
+                VALUES ('test', 'stuck-ref', 'Stuck Ref')
+                """
+            ).lastrowid
+            conn.execute(
+                """
+                INSERT INTO documents(
+                    reference_id, kind, content, embedding_status
+                )
+                VALUES (?, 'fulltext_chunk', '   ', 'pending')
+                """,
+                (int(ref_id),),
+            )
+            conn.commit()
+
+            reasons, report = auto_migrate_if_needed(
+                conn,
+                queue_max_attempts=4,
+                seed_jobs=False,
+            )
+            self.assertIsNotNone(report)
+            self.assertIn(
+                "documents.fulltext_chunk has pending rows with empty content",
+                reasons,
+            )
+            self.assertEqual(report.pending_empty_fulltext_chunks_repaired, 1)
+
+            row = conn.execute(
+                """
+                SELECT embedding_status, embedding_error
+                FROM documents
+                WHERE kind = 'fulltext_chunk'
+                """
+            ).fetchone()
+            self.assertEqual(row[0], "error")
+            self.assertEqual(row[1], LEGACY_EMPTY_CHUNK_REPAIR_ERROR)
 
             reasons_second, report_second = auto_migrate_if_needed(
                 conn,

@@ -9,7 +9,6 @@ from litlake.providers.extraction import (
     ExtractionProvider,
     ExtractionResult,
     GeminiExtractionProvider,
-    LocalFileExtractionProvider,
     LocalPdfExtractionProvider,
 )
 
@@ -21,7 +20,6 @@ __all__ = [
     "FastEmbedEmbeddingProvider",
     "FastEmbedRerankProvider",
     "GeminiExtractionProvider",
-    "LocalFileExtractionProvider",
     "LocalPdfExtractionProvider",
     "RerankProvider",
 ]

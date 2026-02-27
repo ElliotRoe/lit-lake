@@ -1,23 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Protocol
+
+from litlake.providers.extraction import ExtractionResult
+
+
 TARGET_CHUNK_TOKENS = 512
 CHARS_PER_TOKEN = 4.0
-
-
-def split_sentences(text: str) -> list[str]:
-    sentences: list[str] = []
-    current: list[str] = []
-    for char in text:
-        current.append(char)
-        if char in {".", "!", "?"}:
-            s = "".join(current).strip()
-            if s:
-                sentences.append(s)
-            current = []
-    tail = "".join(current).strip()
-    if tail:
-        sentences.append(tail)
-    return sentences
 
 
 def split_sentence_spans(text: str, base_offset: int = 0) -> list[tuple[str, int, int]]:
@@ -141,45 +131,6 @@ def chunk_text_with_spans(
     return chunks
 
 
-def chunk_text(text: str, target_tokens: int = TARGET_CHUNK_TOKENS) -> list[str]:
-    return [chunk_text for chunk_text, _, _ in chunk_text_with_spans(text, target_tokens)]
-
-
-def normalize_extracted_text(text: str) -> str:
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    out_parts: list[str] = []
-
-    for block in normalized.split("\n\n"):
-        block = block.strip()
-        if not block:
-            continue
-
-        paragraph = ""
-        pending_hyphen = False
-        for line in block.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-
-            if pending_hyphen:
-                paragraph += line
-                pending_hyphen = False
-            elif not paragraph:
-                paragraph = line
-            else:
-                paragraph += f" {line}"
-
-            if paragraph.endswith("-"):
-                paragraph = paragraph[:-1]
-                pending_hyphen = True
-
-        collapsed = " ".join(paragraph.split())
-        if collapsed:
-            out_parts.append(collapsed)
-
-    return "\n\n".join(out_parts)
-
-
 def _page_number_for_offset(
     offset: int,
     page_ranges: list[tuple[int, int, int]],
@@ -207,8 +158,6 @@ def map_chunk_spans_to_page_ranges(
     page_texts: list[str],
     separator: str = "\n\n",
 ) -> list[tuple[int | None, int | None]]:
-    """Map chunk offsets to 1-based physical PDF page ranges."""
-
     if not page_texts:
         return [(None, None) for _ in chunk_spans]
 
@@ -241,11 +190,93 @@ def map_chunk_spans_to_page_ranges(
     return spans
 
 
+class ChunkingValidationError(ValueError):
+    """Raised when chunking output violates invariants."""
+
+
+@dataclass(frozen=True)
+class ChunkArtifact:
+    content: str
+    page_start: int | None = None
+    page_end: int | None = None
+
+
+class ChunkingProvider(Protocol):
+    mime_type: str
+
+    def chunk(self, extraction: ExtractionResult) -> list[ChunkArtifact]:
+        ...
+
+
+@dataclass
+class PdfChunkingProvider:
+    mime_type: str = "application/pdf"
+
+    def chunk(self, extraction: ExtractionResult) -> list[ChunkArtifact]:
+        text = extraction.text or ""
+        if not text.strip():
+            raise ChunkingValidationError("Normalized extracted PDF text is empty")
+
+        chunk_spans = chunk_text_with_spans(text, TARGET_CHUNK_TOKENS)
+        if not chunk_spans:
+            raise ChunkingValidationError("PDF chunker produced no chunks")
+
+        page_spans = (
+            map_chunk_spans_to_page_ranges(chunk_spans, extraction.page_texts)
+            if extraction.page_texts is not None
+            else [(None, None) for _ in chunk_spans]
+        )
+
+        artifacts: list[ChunkArtifact] = []
+        for idx, (chunk_text, _, _) in enumerate(chunk_spans):
+            if not chunk_text or not chunk_text.strip():
+                raise ChunkingValidationError(
+                    f"PDF chunker produced empty chunk at index={idx}"
+                )
+            page_start, page_end = page_spans[idx]
+            artifacts.append(
+                ChunkArtifact(
+                    content=chunk_text,
+                    page_start=page_start,
+                    page_end=page_end,
+                )
+            )
+
+        return artifacts
+
+
+@dataclass
+class HtmlChunkingProvider:
+    mime_type: str = "text/html"
+
+    def chunk(self, extraction: ExtractionResult) -> list[ChunkArtifact]:
+        text = extraction.text or ""
+        if not text.strip():
+            raise ChunkingValidationError("Normalized extracted HTML text is empty")
+
+        chunk_spans = chunk_text_with_spans(text, TARGET_CHUNK_TOKENS)
+        if not chunk_spans:
+            raise ChunkingValidationError("HTML chunker produced no chunks")
+
+        artifacts: list[ChunkArtifact] = []
+        for idx, (chunk_text, _, _) in enumerate(chunk_spans):
+            if not chunk_text or not chunk_text.strip():
+                raise ChunkingValidationError(
+                    f"HTML chunker produced empty chunk at index={idx}"
+                )
+            artifacts.append(ChunkArtifact(content=chunk_text))
+
+        return artifacts
+
+
 __all__ = [
-    "TARGET_CHUNK_TOKENS",
-    "chunk_text",
     "chunk_text_with_spans",
-    "split_sentence_spans",
-    "normalize_extracted_text",
+    "ChunkArtifact",
+    "ChunkingProvider",
+    "ChunkingValidationError",
+    "HtmlChunkingProvider",
     "map_chunk_spans_to_page_ranges",
+    "PdfChunkingProvider",
+    "split_sentence_spans",
+    "TARGET_CHUNK_TOKENS",
 ]

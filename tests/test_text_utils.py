@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from litlake.text_utils import chunk_text_with_spans, map_chunk_spans_to_page_ranges
+from litlake.providers.chunking import chunk_text_with_spans, map_chunk_spans_to_page_ranges
 
 
 class ChunkPageRangeTests(unittest.TestCase):
