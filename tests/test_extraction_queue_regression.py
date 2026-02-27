@@ -6,7 +6,7 @@ from pathlib import Path
 
 from litlake.config import Paths, Settings
 from litlake.db import connect_db, enqueue_job, init_db, seed_pending_jobs
-from litlake.providers.extraction import LocalFileExtractionProvider
+from litlake.providers.extraction import LocalPdfExtractionProvider
 from litlake.queue import QueueEngine, QueuePolicy
 from litlake.storage import LocalFSProvider
 from litlake.workers import ExtractionJobHandler, WorkerRuntimeContext
@@ -101,7 +101,7 @@ class ExtractionQueueRegressionTests(unittest.TestCase):
             queue_policy=policy,
         )
         handler = ExtractionJobHandler(
-            extraction_provider=LocalFileExtractionProvider(),
+            extraction_providers=[LocalPdfExtractionProvider()],
             storage_provider=LocalFSProvider(),
         )
         return engine, handler, ctx

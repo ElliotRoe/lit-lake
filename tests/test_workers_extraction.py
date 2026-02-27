@@ -157,7 +157,7 @@ class ExtractionWorkerPageMetadataTests(unittest.TestCase):
         self.assertEqual(len(claimed), 1)
 
         handler = ExtractionJobHandler(
-            extraction_provider=StubPageAwareExtractionProvider(),
+            extraction_providers=[StubPageAwareExtractionProvider()],
             storage_provider=StubStorageProvider(self.pdf_path),
         )
         handler.handle_claimed_job(self.conn, self.engine, claimed[0], self.ctx)
@@ -182,7 +182,7 @@ class ExtractionWorkerPageMetadataTests(unittest.TestCase):
         self.assertEqual(len(claimed), 1)
 
         handler = ExtractionJobHandler(
-            extraction_provider=StubTextOnlyExtractionProvider(),
+            extraction_providers=[StubTextOnlyExtractionProvider()],
             storage_provider=StubStorageProvider(self.pdf_path),
         )
         handler.handle_claimed_job(self.conn, self.engine, claimed[0], self.ctx)
@@ -206,7 +206,7 @@ class ExtractionWorkerPageMetadataTests(unittest.TestCase):
         self.assertEqual(len(claimed), 1)
 
         handler = ExtractionJobHandler(
-            extraction_provider=StubPageAwareExtractionProvider(),
+            extraction_providers=[StubPageAwareExtractionProvider()],
             storage_provider=StubStorageProvider(self.pdf_path),
         )
         handler.handle_claimed_job(self.conn, self.engine, claimed[0], self.ctx)

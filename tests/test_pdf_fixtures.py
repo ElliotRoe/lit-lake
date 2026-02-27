@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from litlake.providers.extraction import LocalFileExtractionProvider
+from litlake.providers.extraction import LocalPdfExtractionProvider
 from litlake.storage import FileLocator
 from tests.fixtures.pdf_factory import (
     MB,
@@ -31,7 +31,7 @@ class PdfFixtureFactoryTests(unittest.TestCase):
     def test_valid_fixture_extracts_and_malformed_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             specs = build_stall_regression_fixture_set(Path(tmp), large_size_bytes=2 * MB)
-            provider = LocalFileExtractionProvider()
+            provider = LocalPdfExtractionProvider()
 
             for spec in specs:
                 locator = FileLocator(

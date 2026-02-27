@@ -34,11 +34,12 @@ from litlake.docs import get_documentation_text
 from litlake.logging_utils import configure_litlake_logging
 from litlake.migration import auto_migrate_if_needed
 from litlake.preview import PdfPreviewRenderer
+from litlake.providers.chunking import ChunkingProvider, PdfChunkingProvider
 from litlake.providers.embedding import FastEmbedEmbeddingProvider, FastEmbedRerankProvider
 from litlake.providers.extraction import (
-    GeminiExtractionProvider,
     ExtractionProvider,
-    LocalFileExtractionProvider,
+    GeminiExtractionProvider,
+    LocalPdfExtractionProvider,
     SUPPORTED_EXTRACTION_MIME_TYPES,
 )
 from litlake.queue import QueuePolicy
@@ -77,15 +78,20 @@ class AppState:
     extraction_worker: QueueWorker | None
 
 
-def _select_extraction_provider(settings: Settings) -> ExtractionProvider:
-    if settings.extraction_backend == "gemini":
+def _build_extraction_providers(settings: Settings) -> list[ExtractionProvider]:
+    if settings.extraction_backend.strip().lower() == "gemini":
         if not settings.gemini_api_key:
             raise ValueError(
                 "EXTRACTION_BACKEND=gemini requires GEMINI_API_KEY. "
                 "Set GEMINI_API_KEY or switch EXTRACTION_BACKEND=local."
             )
-        return GeminiExtractionProvider(api_key=settings.gemini_api_key)
-    return LocalFileExtractionProvider()
+        return [GeminiExtractionProvider(api_key=settings.gemini_api_key)]
+
+    return [LocalPdfExtractionProvider()]
+
+
+def _build_chunking_providers() -> list[ChunkingProvider]:
+    return [PdfChunkingProvider()]
 
 
 def _select_embedding_provider(settings: Settings):
@@ -98,7 +104,8 @@ def _select_rerank_provider(settings: Settings):
 
 def _background_init(state: AppState) -> None:
     try:
-        extraction_provider = _select_extraction_provider(state.settings)
+        extraction_providers = _build_extraction_providers(state.settings)
+        chunking_providers = _build_chunking_providers()
         with state.conn_lock:
             state.init_message = InitStatus.SYNCING_ZOTERO
             try:
@@ -122,9 +129,9 @@ def _background_init(state: AppState) -> None:
             )
             logger.info(
                 "Extraction backend: %s (%s), mime_types=%s",
-                extraction_provider.name,
-                extraction_provider.version,
-                ",".join(sorted(extraction_provider.supported_mime_types)),
+                extraction_providers[0].name,
+                extraction_providers[0].version,
+                ",".join(sorted(extraction_providers[0].supported_mime_types)),
             )
 
             state.init_message = InitStatus.LOADING_EMBED
@@ -158,7 +165,8 @@ def _background_init(state: AppState) -> None:
         state.extraction_worker = QueueWorker(
             ctx=runtime_ctx,
             handler=ExtractionJobHandler(
-                extraction_provider=extraction_provider,
+                extraction_providers=extraction_providers,
+                chunking_providers=chunking_providers,
                 storage_provider=LocalFSProvider(),
             ),
             name="extraction-worker",
@@ -268,10 +276,10 @@ def _resolve_claude_mcp_log_path() -> Path | None:
     name="sync_zotero",
     description=(
         "Import/update references from Zotero into the local library. Creates title and "
-        "abstract documents for each reference, ingests supported attachments (PDF + web "
-        "snapshots), and imports Zotero annotations/notes. Text artifacts are embedded "
-        "asynchronously for semantic search, and extractable attachments are queued for full-text "
-        "extraction (local by default; optional Gemini for PDFs). Call this first if the library "
+        "abstract documents for each reference, ingests supported attachments, and imports Zotero "
+        "annotations/notes. Text artifacts are embedded asynchronously for semantic search, and "
+        "extractable PDF attachments are queued for full-text extraction (local by default; "
+        "optional Gemini for PDFs). Call this first if the library "
         "seems empty or out of date."
     ),
     annotations=ToolAnnotations(title="Sync Zotero Library", readOnlyHint=False, destructiveHint=False),

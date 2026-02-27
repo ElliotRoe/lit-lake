@@ -10,6 +10,8 @@ from pathlib import Path
 from litlake.config import load_settings
 from litlake.db import connect_db, init_db, queue_depth_by_state, seed_pending_jobs
 
+LEGACY_EMPTY_CHUNK_REPAIR_ERROR = "legacy repair: empty fulltext chunk"
+
 
 @dataclasses.dataclass(frozen=True)
 class TextDigest:
@@ -25,6 +27,7 @@ class MigrationReport:
     renamed_pdf_chunks: int
     storage_kind_backfilled: int
     storage_uri_backfilled: int
+    pending_empty_fulltext_chunks_repaired: int
     embedding_status_requeued: int
     extraction_status_requeued: int
     pre_fulltext_union: TextDigest
@@ -105,7 +108,7 @@ def _digest_extracted_text(conn: sqlite3.Connection) -> TextDigest:
     return TextDigest(rows=rows, total_chars=total_chars, sha256=hasher.hexdigest())
 
 
-def _run_data_migration(conn: sqlite3.Connection) -> tuple[int, int, int, int, int]:
+def _run_data_migration(conn: sqlite3.Connection) -> tuple[int, int, int, int, int, int]:
     conn.execute("BEGIN")
     try:
         renamed_pdf_chunks = conn.execute(
@@ -137,6 +140,19 @@ def _run_data_migration(conn: sqlite3.Connection) -> tuple[int, int, int, int, i
                 """
             ).rowcount
 
+        pending_empty_fulltext_chunks_repaired = conn.execute(
+            """
+            UPDATE documents
+            SET embedding_status = 'error',
+                embedding_error = ?,
+                embedding_updated_at = NULL
+            WHERE kind = 'fulltext_chunk'
+              AND embedding_status = 'pending'
+              AND (content IS NULL OR TRIM(content) = '')
+            """,
+            (LEGACY_EMPTY_CHUNK_REPAIR_ERROR,),
+        ).rowcount
+
         # Recover rows that can get stuck in in-flight states after abrupt shutdown.
         embedding_status_requeued = conn.execute(
             """
@@ -157,6 +173,7 @@ def _run_data_migration(conn: sqlite3.Connection) -> tuple[int, int, int, int, i
             renamed_pdf_chunks,
             storage_kind_backfilled,
             storage_uri_backfilled,
+            pending_empty_fulltext_chunks_repaired,
             embedding_status_requeued,
             extraction_status_requeued,
         )
@@ -211,6 +228,18 @@ def detect_migration_reasons(conn: sqlite3.Connection) -> list[str]:
         if int(storage_kind_missing[0]) > 0:
             reasons.append("document_files.storage_kind has missing values")
 
+    pending_empty_fulltext = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM documents
+        WHERE kind = 'fulltext_chunk'
+          AND embedding_status = 'pending'
+          AND (content IS NULL OR TRIM(content) = '')
+        """
+    ).fetchone()
+    if int(pending_empty_fulltext[0]) > 0:
+        reasons.append("documents.fulltext_chunk has pending rows with empty content")
+
     return reasons
 
 
@@ -232,6 +261,7 @@ def run_migration(
         renamed_pdf_chunks,
         storage_kind_backfilled,
         storage_uri_backfilled,
+        pending_empty_fulltext_chunks_repaired,
         embedding_status_requeued,
         extraction_status_requeued,
     ) = _run_data_migration(conn)
@@ -277,6 +307,7 @@ def run_migration(
         renamed_pdf_chunks=renamed_pdf_chunks,
         storage_kind_backfilled=storage_kind_backfilled,
         storage_uri_backfilled=storage_uri_backfilled,
+        pending_empty_fulltext_chunks_repaired=pending_empty_fulltext_chunks_repaired,
         embedding_status_requeued=embedding_status_requeued,
         extraction_status_requeued=extraction_status_requeued,
         pre_fulltext_union=pre_fulltext_union,
@@ -376,6 +407,10 @@ def main() -> None:
     print(f"- Renamed chunks (pdf_chunk -> fulltext_chunk): {payload['renamed_pdf_chunks']}")
     print(f"- Backfilled document_files.storage_kind: {payload['storage_kind_backfilled']}")
     print(f"- Backfilled document_files.storage_uri: {payload['storage_uri_backfilled']}")
+    print(
+        "- Repaired pending fulltext chunks with empty content: "
+        f"{payload['pending_empty_fulltext_chunks_repaired']}"
+    )
     print(f"- Requeued documents from embedding -> pending: {payload['embedding_status_requeued']}")
     print(f"- Requeued files from extracting -> pending: {payload['extraction_status_requeued']}")
     print("")

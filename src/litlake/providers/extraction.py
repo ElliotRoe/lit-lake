@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from litlake.pdf_runtime import capture_mupdf_diagnostics
-from litlake.storage import FileLocator
+from litlake.storage import FileLocator, StorageProvider
 
 ErrorClass = Literal[
     "retryable_io",
@@ -22,8 +22,7 @@ ErrorClass = Literal[
 ]
 
 PDF_MIME_TYPE = "application/pdf"
-HTML_MIME_TYPES = frozenset({"text/html", "application/xhtml+xml"})
-SUPPORTED_EXTRACTION_MIME_TYPES = frozenset({PDF_MIME_TYPE, *HTML_MIME_TYPES})
+SUPPORTED_EXTRACTION_MIME_TYPES = frozenset({PDF_MIME_TYPE})
 logger = logging.getLogger(__name__)
 
 
@@ -33,8 +32,6 @@ def canonicalize_mime_type(mime_type: str | None) -> str | None:
         return None
     if normalized in {"application/x-pdf"}:
         return PDF_MIME_TYPE
-    if normalized in HTML_MIME_TYPES:
-        return "text/html"
     return normalized
 
 
@@ -53,6 +50,14 @@ def _resolve_path(locator: FileLocator) -> Path:
     return path
 
 
+def _resolve_locator_path(locator: FileLocator, storage_provider: StorageProvider | None) -> Path:
+    if storage_provider is not None:
+        return storage_provider.resolve(locator)
+    if locator.storage_kind != "local":
+        raise ValueError(f"Unsupported storage kind for extraction: {locator.storage_kind}")
+    return _resolve_path(locator)
+
+
 def _normalize_mime_type(mime_type: str | None, path: Path) -> str:
     normalized = canonicalize_mime_type(mime_type) or ""
     if not normalized:
@@ -60,8 +65,6 @@ def _normalize_mime_type(mime_type: str | None, path: Path) -> str:
         normalized = canonicalize_mime_type(guessed) or ""
     if normalized == PDF_MIME_TYPE:
         return PDF_MIME_TYPE
-    if normalized == "text/html":
-        return "text/html"
     raise ValueError(f"Unsupported mime type for extraction: {normalized or 'unknown'}")
 
 
@@ -73,6 +76,41 @@ def _looks_like_full_html_document(html: str) -> bool:
         return True
     head = snippet[:2048]
     return "<html" in head and ("<body" in head or "</html>" in head)
+
+
+def _normalize_extracted_text(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    out_parts: list[str] = []
+
+    for block in normalized.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+
+        paragraph = ""
+        pending_hyphen = False
+        for line in block.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            if pending_hyphen:
+                paragraph += line
+                pending_hyphen = False
+            elif not paragraph:
+                paragraph = line
+            else:
+                paragraph += f" {line}"
+
+            if paragraph.endswith("-"):
+                paragraph = paragraph[:-1]
+                pending_hyphen = True
+
+        collapsed = " ".join(paragraph.split())
+        if collapsed:
+            out_parts.append(collapsed)
+
+    return "\n\n".join(out_parts)
 
 
 class _HTMLTextFallbackParser(HTMLParser):
@@ -121,6 +159,13 @@ class _HTMLTextFallbackParser(HTMLParser):
         return text.strip()
 
 
+@dataclass(frozen=True)
+class ExtractionResult:
+    text: str
+    page_texts: list[str] | None = None
+    metadata: dict[str, Any] | None = None
+
+
 def extract_html_text(html: str, *, require_trafilatura: bool = False) -> ExtractionResult:
     should_try_trafilatura = require_trafilatura or _looks_like_full_html_document(html)
     trafilatura = None
@@ -156,19 +201,18 @@ def extract_html_text(html: str, *, require_trafilatura: bool = False) -> Extrac
     return ExtractionResult(text=plain, metadata={"mode": "html_fallback"})
 
 
-@dataclass(frozen=True)
-class ExtractionResult:
-    text: str
-    page_texts: list[str] | None = None
-    metadata: dict[str, Any] | None = None
-
-
 class ExtractionProvider(Protocol):
     name: str
     version: str
     supported_mime_types: frozenset[str]
 
-    def extract(self, locator: FileLocator, *, mime_type: str | None = None) -> ExtractionResult:
+    def extract(
+        self,
+        locator: FileLocator,
+        *,
+        storage_provider: StorageProvider | None = None,
+        mime_type: str | None = None,
+    ) -> ExtractionResult:
         ...
 
     def classify_error(self, exc: Exception) -> ErrorClass:
@@ -176,40 +220,48 @@ class ExtractionProvider(Protocol):
 
 
 @dataclass
-class LocalFileExtractionProvider:
+class LocalPdfExtractionProvider:
     name: str = "local"
     version: str = "pymupdf+trafilatura"
-    supported_mime_types: frozenset[str] = SUPPORTED_EXTRACTION_MIME_TYPES
+    supported_mime_types: frozenset[str] = frozenset({PDF_MIME_TYPE})
 
-    def _extract_pdf(self, path: Path) -> ExtractionResult:
+    def extract(
+        self,
+        locator: FileLocator,
+        *,
+        storage_provider: StorageProvider | None = None,
+        mime_type: str | None = None,
+    ) -> ExtractionResult:
+        path = _resolve_locator_path(locator, storage_provider)
+        normalized_mime = _normalize_mime_type(mime_type, path)
+        if normalized_mime != PDF_MIME_TYPE:
+            raise ValueError(f"Unsupported mime type for local PDF extraction: {normalized_mime}")
+
         import fitz  # pymupdf
 
-        pages: list[str] = []
+        raw_pages: list[str] = []
         with capture_mupdf_diagnostics(f"extract:{path}", log=logger):
             doc = fitz.open(str(path))
             try:
                 for page in doc:
-                    text = page.get_text("text") or ""
-                    pages.append(text)
+                    raw_pages.append(page.get_text("text") or "")
             finally:
                 doc.close()
 
-        return ExtractionResult(text="\n\n".join(pages), page_texts=pages)
+        raw_text = "\n\n".join(raw_pages)
+        if not raw_text.strip():
+            raise ValueError(f"Extraction produced empty text for {path}")
 
-    def _extract_html(self, path: Path) -> ExtractionResult:
-        html = path.read_text(encoding="utf-8", errors="ignore")
-        return extract_html_text(html, require_trafilatura=True)
+        normalized_pages = [_normalize_extracted_text(page) for page in raw_pages]
+        normalized_text = "\n\n".join(normalized_pages)
+        if not normalized_text.strip():
+            raise ValueError(f"Normalized extraction is empty for {path}")
 
-    def extract(self, locator: FileLocator, *, mime_type: str | None = None) -> ExtractionResult:
-        if locator.storage_kind != "local":
-            raise ValueError(f"Unsupported storage kind for local extraction: {locator.storage_kind}")
-        path = _resolve_path(locator)
-        normalized_mime = _normalize_mime_type(mime_type, path)
-        if normalized_mime == PDF_MIME_TYPE:
-            return self._extract_pdf(path)
-        if normalized_mime in HTML_MIME_TYPES:
-            return self._extract_html(path)
-        raise ValueError(f"Unsupported mime type for local extraction: {normalized_mime}")
+        return ExtractionResult(
+            text=normalized_text,
+            page_texts=normalized_pages,
+            metadata={"mode": "pymupdf", "normalized": True},
+        )
 
     def classify_error(self, exc: Exception) -> ErrorClass:
         try:
@@ -293,8 +345,14 @@ class GeminiExtractionProvider:
         if not res.ok:
             return
 
-    def extract(self, locator: FileLocator, *, mime_type: str | None = None) -> ExtractionResult:
-        path = _resolve_path(locator)
+    def extract(
+        self,
+        locator: FileLocator,
+        *,
+        storage_provider: StorageProvider | None = None,
+        mime_type: str | None = None,
+    ) -> ExtractionResult:
+        path = _resolve_locator_path(locator, storage_provider)
         normalized_mime = self._detect_mime(path, mime_type=mime_type)
         if normalized_mime not in self.supported_mime_types:
             raise ValueError(f"Unsupported mime type for gemini extraction: {normalized_mime}")
@@ -303,17 +361,11 @@ class GeminiExtractionProvider:
         file_name = file_info.get("name")
         file_uri = file_info.get("uri")
         try:
-            if normalized_mime == PDF_MIME_TYPE:
-                prompt = (
-                    "Convert this PDF document to Markdown format. "
-                    "Preserve headings, lists, tables, and equations where possible. "
-                    "Output only markdown content."
-                )
-            else:
-                prompt = (
-                    "Extract the main textual content from this HTML snapshot and convert it to Markdown. "
-                    "Preserve headings, lists, and tables where possible. Output only markdown content."
-                )
+            prompt = (
+                "Convert this PDF document to Markdown format. "
+                "Preserve headings, lists, tables, and equations where possible. "
+                "Output only markdown content."
+            )
             body = {
                 "contents": [
                     {
@@ -340,10 +392,17 @@ class GeminiExtractionProvider:
             if not candidates:
                 raise RuntimeError(f"Gemini returned no candidates: {payload}")
             parts = candidates[0].get("content", {}).get("parts", [])
-            text = "\n".join(part.get("text", "") for part in parts if isinstance(part, dict))
+            raw_text = "\n".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
+            if not raw_text:
+                raise ValueError(f"Extraction produced empty text for {path}")
+
+            normalized_text = _normalize_extracted_text(raw_text)
+            if not normalized_text.strip():
+                raise ValueError(f"Normalized extraction is empty for {path}")
+
             return ExtractionResult(
-                text=text.strip(),
-                metadata={"mode": "gemini", "input_mime_type": normalized_mime},
+                text=normalized_text,
+                metadata={"mode": "gemini", "input_mime_type": normalized_mime, "normalized": True},
             )
         finally:
             if file_name:
@@ -369,9 +428,6 @@ class GeminiExtractionProvider:
             return "retryable_io"
         return "retryable_io"
 
-# Backward-compatible alias.
-LocalPdfExtractionProvider = LocalFileExtractionProvider
-
 
 __all__ = [
     "canonicalize_mime_type",
@@ -379,9 +435,7 @@ __all__ = [
     "ExtractionProvider",
     "ExtractionResult",
     "extract_html_text",
-    "HTML_MIME_TYPES",
     "GeminiExtractionProvider",
-    "LocalFileExtractionProvider",
     "LocalPdfExtractionProvider",
     "PDF_MIME_TYPE",
     "SUPPORTED_EXTRACTION_MIME_TYPES",

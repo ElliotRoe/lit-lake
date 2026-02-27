@@ -8,7 +8,7 @@ from pathlib import Path
 
 from litlake.pdf_runtime import configure_mupdf_output_suppression
 from litlake.preview import PdfPreviewRenderer
-from litlake.providers.extraction import LocalFileExtractionProvider
+from litlake.providers.extraction import LocalPdfExtractionProvider
 from litlake.storage import FileLocator
 
 
@@ -44,7 +44,7 @@ class PdfStdoutSafetyTests(unittest.TestCase):
             bad_pdf = Path(tmp) / "bad.pdf"
             bad_pdf.write_bytes(b"not-a-pdf")
 
-            provider = LocalFileExtractionProvider()
+            provider = LocalPdfExtractionProvider()
             locator = FileLocator(
                 storage_kind="local",
                 file_path=str(bad_pdf),
@@ -81,4 +81,3 @@ class PdfStdoutSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
