@@ -26,12 +26,13 @@ def utc_now_iso() -> str:
 
 def connect_db(path: Path | str, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
-        conn = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True, check_same_thread=False)
+        conn = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True, check_same_thread=False, timeout=30, isolation_level=None)
     else:
-        conn = sqlite3.connect(str(path), check_same_thread=False)
+        conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000;")
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA locking_mode=NORMAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     _load_sqlite_vec(conn)
     return conn
