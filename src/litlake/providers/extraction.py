@@ -164,6 +164,7 @@ class ExtractionResult:
     text: str
     page_texts: list[str] | None = None
     metadata: dict[str, Any] | None = None
+    page_blocks: list[list[dict]] | None = None  # per-page PyMuPDF blocks with bbox coords
 
 
 def extract_html_text(html: str, *, require_trafilatura: bool = False) -> ExtractionResult:
@@ -240,11 +241,26 @@ class LocalPdfExtractionProvider:
         import fitz  # pymupdf
 
         raw_pages: list[str] = []
+        raw_blocks: list[list[dict]] = []
         with capture_mupdf_diagnostics(f"extract:{path}", log=logger):
             doc = fitz.open(str(path))
             try:
                 for page in doc:
                     raw_pages.append(page.get_text("text") or "")
+                    page_dict = page.get_text("dict")
+                    blocks = [
+                        {
+                            "bbox": b["bbox"],
+                            "text": "".join(
+                                span["text"]
+                                for line in b.get("lines", [])
+                                for span in line.get("spans", [])
+                            ),
+                        }
+                        for b in page_dict.get("blocks", [])
+                        if b.get("type") == 0  # type 0 = text block
+                    ]
+                    raw_blocks.append(blocks)
             finally:
                 doc.close()
 
@@ -260,6 +276,7 @@ class LocalPdfExtractionProvider:
         return ExtractionResult(
             text=normalized_text,
             page_texts=normalized_pages,
+            page_blocks=raw_blocks,
             metadata={"mode": "pymupdf", "normalized": True},
         )
 
