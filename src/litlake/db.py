@@ -276,6 +276,63 @@ def init_db(conn: sqlite3.Connection) -> None:
         else:
             raise
 
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zotero_collection_id INTEGER NOT NULL UNIQUE,
+            zotero_key TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            parent_zotero_collection_id INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collection_items (
+            collection_id INTEGER NOT NULL,
+            reference_id INTEGER NOT NULL,
+            PRIMARY KEY (collection_id, reference_id),
+            FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+            FOREIGN KEY(reference_id) REFERENCES reference_items(id) ON DELETE CASCADE
+        )
+        """
+    )
+    _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_collection_items_reference ON collection_items(reference_id)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zotero_collection_id INTEGER UNIQUE,
+            zotero_key TEXT,
+            name TEXT NOT NULL,
+            parent_zotero_collection_id INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collection_items (
+            collection_id INTEGER NOT NULL,
+            reference_id INTEGER NOT NULL,
+            PRIMARY KEY (collection_id, reference_id),
+            FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+            FOREIGN KEY(reference_id) REFERENCES reference_items(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_collection_items_reference_id ON collection_items(reference_id)")
+
+
     conn.commit()
 
 

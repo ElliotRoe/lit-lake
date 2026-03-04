@@ -466,6 +466,56 @@ def library_status(ctx: Context) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+
+@mcp.tool(
+    name="list_collections",
+    description=(
+        "List all Zotero collections (folders) with their hierarchy. "
+        "Returns collection names, IDs, and parent-child relationships. "
+        "Use collection_id with sql_search to filter references by collection, e.g.: "
+        "SELECT r.* FROM reference_items r "
+        "JOIN collection_items ci ON ci.reference_id = r.id "
+        "JOIN collections c ON c.id = ci.collection_id "
+        "WHERE c.id = <collection_id>"
+    ),
+    annotations=ToolAnnotations(title="List Zotero Collections", readOnlyHint=True, destructiveHint=False),
+)
+def list_collections(ctx: Context) -> str:
+    import json
+    state = _state(ctx)
+    with state.conn_lock:
+        collections = state.conn.execute(
+            """
+            SELECT
+                c.id,
+                c.zotero_collection_id,
+                c.name,
+                c.parent_zotero_collection_id,
+                p.id as parent_id,
+                p.name as parent_name,
+                COUNT(ci.reference_id) as item_count
+            FROM collections c
+            LEFT JOIN collections p ON p.zotero_collection_id = c.parent_zotero_collection_id
+            LEFT JOIN collection_items ci ON ci.collection_id = c.id
+            GROUP BY c.id
+            ORDER BY COALESCE(p.name, c.name), c.name
+            """
+        ).fetchall()
+
+    result = [
+        {
+            "id": int(row[0]),
+            "zotero_collection_id": row[1],
+            "name": row[2],
+            "parent_id": int(row[4]) if row[4] is not None else None,
+            "parent_name": row[5],
+            "item_count": int(row[6]),
+        }
+        for row in collections
+    ]
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
 @mcp.tool(
     name="get_debug_log_path",
     description=(
