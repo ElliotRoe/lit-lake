@@ -59,6 +59,21 @@ class ZoteroItem:
     notes: list[ZoteroNote] = field(default_factory=list)
 
 
+
+@dataclass
+class ZoteroCollection:
+    collection_id: int
+    key: str
+    name: str
+    parent_collection_id: int | None
+
+
+@dataclass
+class ZoteroCollectionMembership:
+    collection_id: int
+    item_id: int
+
+
 class ZoteroReader:
     def __init__(self, db_path: str | None = None):
         self.db_path = self._find_db_path(db_path)
@@ -91,6 +106,48 @@ class ZoteroReader:
         if not full_path.exists():
             return None
         return str(full_path)
+
+    def get_collections(self) -> tuple[list[ZoteroCollection], list[ZoteroCollectionMembership]]:
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+
+        collection_rows = conn.execute(
+            """
+            SELECT collectionID, key, collectionName, parentCollectionID
+            FROM collections
+            ORDER BY collectionID
+            """
+        ).fetchall()
+
+        collections = [
+            ZoteroCollection(
+                collection_id=int(row[0]),
+                key=row[1],
+                name=row[2],
+                parent_collection_id=int(row[3]) if row[3] is not None else None,
+            )
+            for row in collection_rows
+        ]
+
+        membership_rows = conn.execute(
+            """
+            SELECT collectionID, itemID
+            FROM collectionItems
+            ORDER BY collectionID, itemID
+            """
+        ).fetchall()
+
+        memberships = [
+            ZoteroCollectionMembership(
+                collection_id=int(row[0]),
+                item_id=int(row[1]),
+            )
+            for row in membership_rows
+        ]
+
+        conn.close()
+        return collections, memberships
+
 
     def get_items(self) -> list[ZoteroItem]:
         conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
@@ -274,7 +331,27 @@ class ZoteroReader:
 __all__ = [
     "ZoteroAttachment",
     "ZoteroAnnotation",
+    "ZoteroCollection",
+    "ZoteroCollectionMembership",
     "ZoteroItem",
     "ZoteroNote",
     "ZoteroReader",
 ]
+
+
+@dataclass
+class ZoteroCollection:
+    collection_id: int
+    key: str
+    name: str
+    parent_collection_id: int | None
+
+
+@dataclass 
+class ZoteroCollectionMembership:
+    collection_id: int
+    item_id: int
+
+
+def _get_collections_patch():
+    pass  # placeholder - see next step
