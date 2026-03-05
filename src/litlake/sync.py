@@ -435,10 +435,18 @@ def sync_zotero(
 
     conn.execute("BEGIN")
     for item in items:
+        # Build metadata JSON blob with all bibliographic fields and tags
+        metadata_blob: dict[str, Any] = {}
+        if item.metadata_fields:
+            metadata_blob.update(item.metadata_fields)
+        if item.tags:
+            metadata_blob["tags"] = item.tags
+        metadata_json = _to_json(metadata_blob) if metadata_blob else None
+
         if item.key in existing_map:
             reference_id = existing_map[item.key]
             existing_reference = conn.execute(
-                "SELECT title, authors, year FROM reference_items WHERE id = ?",
+                "SELECT title, authors, year, item_type, metadata FROM reference_items WHERE id = ?",
                 (reference_id,),
             ).fetchone()
             if existing_reference is None:
@@ -447,15 +455,18 @@ def sync_zotero(
                 (existing_reference[0] or None) != item.title
                 or (existing_reference[1] or None) != item.authors
                 or (existing_reference[2] or None) != item.date
+                or (existing_reference[3] or None) != item.item_type
+                or (existing_reference[4] or None) != metadata_json
             )
             if changed:
                 conn.execute(
                     """
                     UPDATE reference_items
-                    SET title = ?, authors = ?, year = ?, updated_at = CURRENT_TIMESTAMP
+                    SET title = ?, authors = ?, year = ?, item_type = ?, metadata = ?,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (item.title, item.authors, item.date, reference_id),
+                    (item.title, item.authors, item.date, item.item_type, metadata_json, reference_id),
                 )
                 ref_counts.record("updated")
             else:
@@ -463,10 +474,10 @@ def sync_zotero(
         else:
             cur = conn.execute(
                 """
-                INSERT INTO reference_items (title, authors, year, source_system, source_id)
-                VALUES (?, ?, ?, 'zotero', ?)
+                INSERT INTO reference_items (title, authors, year, item_type, metadata, source_system, source_id)
+                VALUES (?, ?, ?, ?, ?, 'zotero', ?)
                 """,
-                (item.title, item.authors, item.date, item.key),
+                (item.title, item.authors, item.date, item.item_type, metadata_json, item.key),
             )
             reference_id = int(cur.lastrowid)
             conn.execute(
