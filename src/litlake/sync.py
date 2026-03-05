@@ -718,13 +718,10 @@ def sync_zotero(
                 if updated_n:
                     parts.append(f"{len(updated_n)} updated note{'s' if len(updated_n) != 1 else ''}")
             lines.append(f"- **{title[:70]}**: {', '.join(parts)}")
-            # Show excerpts for added annotations (max 3 per title)
-            shown = 0
             for d in details:
-                if d.excerpt and d.outcome == "added" and shown < 3:
+                if d.excerpt and d.outcome == "added":
                     page_info = f"p. {d.page}: " if d.page else ""
                     lines.append(f"  - {page_info}{d.excerpt}")
-                    shown += 1
 
     return "\n".join(lines)
 
