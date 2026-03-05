@@ -279,6 +279,11 @@ def init_db(conn: sqlite3.Connection, *, embedding_dim: int = 384) -> None:
                     "embedding_backend = NULL, embedding_model = NULL "
                     "WHERE embedding_status = 'ready'"
                 )
+                # Clear old embedding jobs so seed_pending_jobs creates new ones
+                conn.execute(
+                    "DELETE FROM jobs WHERE queue_name = 'embedding' "
+                    "AND status IN ('succeeded', 'dead', 'failed')"
+                )
                 logger.info(
                     "Embedding dimension changed to %d – recreated vec_documents and reset all embeddings to pending",
                     embedding_dim,
