@@ -35,6 +35,8 @@ class ZoteroAnnotation:
     sort_index: str
     position: str
     is_external: int
+    date_added: str | None = None
+    date_modified: str | None = None
 
 
 @dataclass
@@ -260,7 +262,9 @@ class ZoteroReader:
                 ia.pageLabel,
                 ia.sortIndex,
                 ia.position,
-                ia.isExternal
+                ia.isExternal,
+                ann_item.dateAdded,
+                ann_item.dateModified
             FROM itemAnnotations ia
             JOIN items ann_item ON ann_item.itemID = ia.itemID
             LEFT JOIN itemAttachments att ON att.itemID = ia.parentItemID
@@ -291,6 +295,8 @@ class ZoteroReader:
                     sort_index=row[11] or "",
                     position=row[12] or "",
                     is_external=int(row[13]) if row[13] is not None else 0,
+                    date_added=row[14],
+                    date_modified=row[15],
                 )
             )
 
