@@ -95,7 +95,10 @@ def _build_chunking_providers() -> list[ChunkingProvider]:
 
 
 def _select_embedding_provider(settings: Settings):
-    return FastEmbedEmbeddingProvider(models_path=settings.paths.models_path)
+    return FastEmbedEmbeddingProvider(
+        models_path=settings.paths.models_path,
+        model_name=settings.embedding_model,
+    )
 
 
 def _select_rerank_provider(settings: Settings):
@@ -190,8 +193,10 @@ def _background_init(state: AppState) -> None:
 
 
 def _build_state(settings: Settings) -> AppState:
+    from litlake.providers.embedding import MODEL_DIMENSIONS
+    embedding_dim = MODEL_DIMENSIONS.get(settings.embedding_model, 384)
     conn = connect_db(settings.paths.db_path)
-    init_db(conn)
+    init_db(conn, embedding_dim=embedding_dim)
     reasons, migration_report = auto_migrate_if_needed(
         conn,
         queue_max_attempts=settings.queue_max_attempts,
