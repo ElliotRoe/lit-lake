@@ -635,6 +635,78 @@ def preview_document_pdf_pages(
     return CallToolResult(content=content)
 
 
+@mcp.tool(
+    name="get_page_text",
+    description=(
+        "Get the full text of specific pages from a PDF in the library. "
+        "Provide either a reference_id (from reference_items) or a document_file_id "
+        "(from document_files). Returns the raw extracted text for the requested page range. "
+        "Useful for reading specific pages, verifying quotes, or getting context around a passage."
+    ),
+    annotations=ToolAnnotations(title="Get Page Text", readOnlyHint=True, destructiveHint=False),
+)
+def get_page_text(
+    ctx: Context,
+    reference_id: int | None = None,
+    document_file_id: int | None = None,
+    start_page: int = 1,
+    end_page: int | None = None,
+) -> str:
+    import fitz
+
+    if reference_id is None and document_file_id is None:
+        raise ValueError("Provide either reference_id or document_file_id")
+
+    state = _state(ctx)
+
+    with state.conn_lock:
+        if document_file_id is not None:
+            row = state.conn.execute(
+                "SELECT file_path, mime_type FROM document_files WHERE id = ?",
+                (document_file_id,),
+            ).fetchone()
+        else:
+            row = state.conn.execute(
+                "SELECT file_path, mime_type FROM document_files "
+                "WHERE reference_id = ? AND mime_type = 'application/pdf' LIMIT 1",
+                (reference_id,),
+            ).fetchone()
+
+    if not row:
+        raise ValueError("No PDF found for the given reference_id or document_file_id")
+
+    file_path, mime_type = row[0], row[1]
+    if mime_type and mime_type != "application/pdf":
+        raise ValueError(f"Only PDFs are supported (got {mime_type})")
+
+    if end_page is None:
+        end_page = start_page
+
+    if start_page <= 0 or end_page <= 0:
+        raise ValueError("Pages are 1-based; start_page/end_page must be >= 1")
+    if start_page > end_page:
+        raise ValueError("start_page must be <= end_page")
+    if (end_page - start_page + 1) > 20:
+        raise ValueError("Max 20 pages per call")
+
+    doc = fitz.open(file_path)
+    try:
+        total_pages = len(doc)
+        if start_page > total_pages:
+            raise ValueError(f"start_page {start_page} exceeds document length ({total_pages} pages)")
+        end_page = min(end_page, total_pages)
+
+        pages_text: list[str] = []
+        for page_num in range(start_page, end_page + 1):
+            page = doc[page_num - 1]  # fitz is 0-indexed
+            text = page.get_text("text").strip()
+            pages_text.append(f"--- Page {page_num} ---\n{text}")
+
+        return "\n\n".join(pages_text)
+    finally:
+        doc.close()
+
+
 def main() -> None:
     mcp.run(transport="stdio")
 
