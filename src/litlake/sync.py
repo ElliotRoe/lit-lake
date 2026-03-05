@@ -294,13 +294,20 @@ def _upsert_annotation_documents(
         )
         counts.record(outcome)
         if outcome in ("added", "updated"):
-            excerpt = (annotation.text or "")[:80].strip()
+            text_excerpt = (annotation.text or "")[:80].strip()
+            comment_excerpt = (annotation.comment or "")[:80].strip()
+            if text_excerpt and comment_excerpt:
+                excerpt = f"{text_excerpt}... // {comment_excerpt}"
+            elif comment_excerpt:
+                excerpt = f"[comment] {comment_excerpt}"
+            else:
+                excerpt = text_excerpt if text_excerpt else None
             counts.add_detail(_DiffDetail(
                 title=item.title or "(untitled)",
                 kind="annotation",
                 outcome=outcome,
                 page=annotation.page_label,
-                excerpt=excerpt if excerpt else None,
+                excerpt=excerpt,
             ))
     return counts
 
@@ -711,6 +718,13 @@ def sync_zotero(
                 if updated_n:
                     parts.append(f"{len(updated_n)} updated note{'s' if len(updated_n) != 1 else ''}")
             lines.append(f"- **{title[:70]}**: {', '.join(parts)}")
+            # Show excerpts for added annotations (max 3 per title)
+            shown = 0
+            for d in details:
+                if d.excerpt and d.outcome == "added" and shown < 3:
+                    page_info = f"p. {d.page}: " if d.page else ""
+                    lines.append(f"  - {page_info}{d.excerpt}")
+                    shown += 1
 
     return "\n".join(lines)
 
