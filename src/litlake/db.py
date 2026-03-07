@@ -158,6 +158,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "document_files", "storage_kind", "storage_kind TEXT DEFAULT 'local'")
     _ensure_column(conn, "document_files", "storage_uri", "storage_uri TEXT")
 
+    # Bibliographic metadata fields (Issue #18)
+    _ensure_column(conn, "reference_items", "item_type", "item_type TEXT")
+
     _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_documents_reference_id ON documents(reference_id)")
     _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_documents_kind ON documents(kind)")
     _ensure_index(
