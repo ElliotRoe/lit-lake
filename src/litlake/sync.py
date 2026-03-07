@@ -276,6 +276,8 @@ def _upsert_annotation_documents(
             "position": annotation.position,
             "is_external": annotation.is_external,
             "parent_attachment_key": annotation.parent_attachment_key,
+            "date_added": annotation.date_added,
+            "date_modified": annotation.date_modified,
         }
         document_file_id = (
             document_file_ids.get(annotation.parent_attachment_key)
