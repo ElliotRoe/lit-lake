@@ -7,7 +7,7 @@ from typing import Any
 
 from litlake.db import enqueue_job
 from litlake.providers.extraction import SUPPORTED_EXTRACTION_MIME_TYPES, extract_html_text
-from litlake.zotero import ZoteroAnnotation, ZoteroCollection, ZoteroCollectionMembership, ZoteroItem, ZoteroReader, ZoteroRelation
+from litlake.zotero import ZoteroAnnotation, ZoteroCollection, ZoteroCollectionMembership, ZoteroItem, ZoteroReader
 
 
 def _to_json(value: dict[str, Any] | None) -> str | None:
@@ -456,30 +456,6 @@ def _sync_collections_with_ids(
         )
 
 
-def _sync_relations(
-    conn: sqlite3.Connection,
-    relations: list[ZoteroRelation],
-    zotero_key_to_reference_id: dict[str, int],
-) -> int:
-    """Rebuild reference_relations from Zotero itemRelations."""
-    conn.execute("DELETE FROM reference_relations")
-    inserted = 0
-    for rel in relations:
-        source_id = zotero_key_to_reference_id.get(rel.source_key)
-        target_id = zotero_key_to_reference_id.get(rel.target_key)
-        if source_id is None or target_id is None:
-            continue
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO reference_relations (source_reference_id, target_reference_id, predicate)
-            VALUES (?, ?, ?)
-            """,
-            (source_id, target_id, rel.predicate),
-        )
-        inserted += 1
-    return inserted
-
-
 def sync_zotero(
     conn: sqlite3.Connection,
     *,
@@ -489,7 +465,6 @@ def sync_zotero(
     reader = ZoteroReader(explicit_db_path)
     items = reader.get_items()
     collections, memberships = reader.get_collections()
-    relations = reader.get_relations()
 
     existing_map_rows = conn.execute(
         "SELECT value, reference_id FROM reference_external_ids WHERE scheme = 'zotero_key'"
@@ -609,9 +584,6 @@ def sync_zotero(
     # Sync collections
     zotero_item_id_to_reference_id = {item.item_id: existing_map[item.key] for item in items if item.key in existing_map}
     _sync_collections_with_ids(conn, collections, memberships, zotero_item_id_to_reference_id)
-
-    # Sync related items
-    relation_count = _sync_relations(conn, relations, existing_map)
     conn.commit()
 
     embeddable_kinds = ("title", "abstract", "fulltext_chunk", "annotation", "note")
