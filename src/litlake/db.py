@@ -362,6 +362,22 @@ def init_db(conn: sqlite3.Connection, *, embedding_dim: int = 384) -> None:
 
     _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_collection_items_reference_id ON collection_items(reference_id)")
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reference_relations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_reference_id INTEGER NOT NULL,
+            target_reference_id INTEGER NOT NULL,
+            predicate TEXT NOT NULL,
+            UNIQUE(source_reference_id, target_reference_id, predicate),
+            FOREIGN KEY(source_reference_id) REFERENCES reference_items(id) ON DELETE CASCADE,
+            FOREIGN KEY(target_reference_id) REFERENCES reference_items(id) ON DELETE CASCADE
+        )
+        """
+    )
+    _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_reference_relations_source ON reference_relations(source_reference_id)")
+    _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_reference_relations_target ON reference_relations(target_reference_id)")
+
 
     conn.commit()
 

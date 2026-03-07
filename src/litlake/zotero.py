@@ -66,6 +66,13 @@ class ZoteroItem:
 
 
 @dataclass
+class ZoteroRelation:
+    source_key: str
+    target_key: str
+    predicate: str  # 'dc:relation' for Related Items, 'owl:sameAs' for group links
+
+
+@dataclass
 class ZoteroCollection:
     collection_id: int
     key: str
@@ -153,6 +160,30 @@ class ZoteroReader:
         conn.close()
         return collections, memberships
 
+    def get_relations(self) -> list[ZoteroRelation]:
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        rows = conn.execute(
+            """
+            SELECT i.key, rp.predicate, ir.object
+            FROM itemRelations ir
+            JOIN items i ON i.itemID = ir.itemID
+            JOIN relationPredicates rp ON rp.predicateID = ir.predicateID
+            """
+        ).fetchall()
+        conn.close()
+
+        relations: list[ZoteroRelation] = []
+        for source_key, predicate, object_uri in rows:
+            # Extract target key from URI like http://zotero.org/users/.../items/ABCDEF
+            target_key = str(object_uri).rsplit("/", 1)[-1] if object_uri else None
+            if not target_key:
+                continue
+            relations.append(ZoteroRelation(
+                source_key=str(source_key),
+                target_key=target_key,
+                predicate=str(predicate),
+            ))
+        return relations
 
     def get_items(self) -> list[ZoteroItem]:
         conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
@@ -393,6 +424,7 @@ __all__ = [
     "ZoteroItem",
     "ZoteroNote",
     "ZoteroReader",
+    "ZoteroRelation",
 ]
 
 
