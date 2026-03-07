@@ -746,6 +746,9 @@ def get_passage_context(
             parts.append(content)
 
     return "\n\n".join(parts)
+
+
+@mcp.tool(
     name="get_page_text",
     description=(
         "Get the full text of specific pages from a PDF in the library. "
