@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+logger = logging.getLogger(__name__)
 
 from litlake.providers.extraction import SUPPORTED_EXTRACTION_MIME_TYPES
 
@@ -67,7 +70,7 @@ def _ensure_index(conn: sqlite3.Connection, sql: str) -> None:
     conn.execute(sql)
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn: sqlite3.Connection, *, embedding_dim: int = 384) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS reference_items (
@@ -259,14 +262,38 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
 
-    # sqlite-vec virtual table for embeddings (must remain contract-compatible).
+    # sqlite-vec virtual table for embeddings.
+    # If the dimension changes (model switch), recreate the table and reset all embeddings.
     try:
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_documents USING vec0(embedding float[384]);"
-        )
+        expected_ddl = f"CREATE VIRTUAL TABLE vec_documents USING vec0(embedding float[{embedding_dim}])"
+        existing = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_documents'"
+        ).fetchone()
+
+        if existing and existing[0]:
+            current_ddl = existing[0].strip()
+            if f"float[{embedding_dim}]" not in current_ddl:
+                # Dimension mismatch – drop and recreate, reset all embeddings
+                conn.execute("DROP TABLE vec_documents")
+                conn.execute(f"CREATE VIRTUAL TABLE vec_documents USING vec0(embedding float[{embedding_dim}]);")
+                conn.execute(
+                    "UPDATE documents SET embedding_status = 'pending', "
+                    "embedding_error = NULL, embedding_updated_at = NULL, "
+                    "embedding_backend = NULL, embedding_model = NULL "
+                    "WHERE embedding_status = 'ready'"
+                )
+                # Clear old embedding jobs so seed_pending_jobs creates new ones
+                conn.execute(
+                    "DELETE FROM jobs WHERE queue_name = 'embedding' "
+                    "AND status IN ('succeeded', 'dead', 'failed')"
+                )
+                logger.info(
+                    "Embedding dimension changed to %d – recreated vec_documents and reset all embeddings to pending",
+                    embedding_dim,
+                )
+        else:
+            conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_documents USING vec0(embedding float[{embedding_dim}]);")
     except sqlite3.OperationalError as exc:
-        # If sqlite-vec isn't available in the current runtime, keep a fallback
-        # table so non-vector tests and tooling can still execute.
         if "no such module: vec0" in str(exc):
             conn.execute(
                 """
