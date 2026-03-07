@@ -26,10 +26,10 @@ class RerankProvider(Protocol):
 @dataclass
 class FastEmbedEmbeddingProvider:
     models_path: Path
-    model_name: str = "BAAI/bge-small-en-v1.5"
+    model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
     name: str = "fastembed"
-    version: str = "bge-small-en-v1.5"
-    dim: int = 384
+    version: str = "paraphrase-multilingual-mpnet-base-v2"
+    dim: int = 768
 
     def __post_init__(self) -> None:
         from fastembed import TextEmbedding
