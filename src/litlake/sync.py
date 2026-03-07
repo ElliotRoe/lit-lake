@@ -31,10 +31,21 @@ def _note_html_to_text(note_html: str | None) -> str | None:
 
 
 @dataclass
+class _DiffDetail:
+    """One added or updated annotation/note."""
+    title: str
+    kind: str  # 'annotation' or 'note'
+    outcome: str  # 'added' or 'updated'
+    page: str | None = None
+    excerpt: str | None = None
+
+
+@dataclass
 class _DeltaCounts:
     added: int = 0
     updated: int = 0
     unchanged: int = 0
+    diff_details: list[_DiffDetail] | None = None
 
     def record(self, outcome: str) -> None:
         if outcome == "added":
@@ -47,6 +58,11 @@ class _DeltaCounts:
             self.unchanged += 1
             return
         raise ValueError(f"Unsupported delta outcome: {outcome}")
+
+    def add_detail(self, detail: _DiffDetail) -> None:
+        if self.diff_details is None:
+            self.diff_details = []
+        self.diff_details.append(detail)
 
     @property
     def changed(self) -> int:
@@ -266,16 +282,33 @@ def _upsert_annotation_documents(
             if annotation.parent_attachment_key
             else None
         )
+        content = _build_annotation_content(annotation)
         outcome = _upsert_document(
             conn,
             reference_id=reference_id,
             kind="annotation",
             source_id=annotation.key,
-            content=_build_annotation_content(annotation),
+            content=content,
             document_file_id=document_file_id,
             metadata=metadata,
         )
         counts.record(outcome)
+        if outcome in ("added", "updated"):
+            text_excerpt = (annotation.text or "")[:80].strip()
+            comment_excerpt = (annotation.comment or "")[:80].strip()
+            if text_excerpt and comment_excerpt:
+                excerpt = f"{text_excerpt}... // {comment_excerpt}"
+            elif comment_excerpt:
+                excerpt = f"[comment] {comment_excerpt}"
+            else:
+                excerpt = text_excerpt if text_excerpt else None
+            counts.add_detail(_DiffDetail(
+                title=item.title or "(untitled)",
+                kind="annotation",
+                outcome=outcome,
+                page=annotation.page_label,
+                excerpt=excerpt,
+            ))
     return counts
 
 
@@ -289,15 +322,24 @@ def _upsert_note_documents(
             "title": note.title,
             "parent_item_id": note.parent_item_id,
         }
+        content = _note_html_to_text(note.note_html)
         outcome = _upsert_document(
             conn,
             reference_id=reference_id,
             kind="note",
             source_id=note.key,
-            content=_note_html_to_text(note.note_html),
+            content=content,
             metadata=metadata,
         )
         counts.record(outcome)
+        if outcome in ("added", "updated"):
+            excerpt = (content or "")[:80].strip()
+            counts.add_detail(_DiffDetail(
+                title=item.title or "(untitled)",
+                kind="note",
+                outcome=outcome,
+                excerpt=excerpt if excerpt else None,
+            ))
     return counts
 
 
@@ -513,10 +555,16 @@ def sync_zotero(
         annotation_counts.added += annotation_deltas.added
         annotation_counts.updated += annotation_deltas.updated
         annotation_counts.unchanged += annotation_deltas.unchanged
+        if annotation_deltas.diff_details:
+            for d in annotation_deltas.diff_details:
+                annotation_counts.add_detail(d)
         note_deltas = _upsert_note_documents(conn, reference_id=reference_id, item=item)
         note_counts.added += note_deltas.added
         note_counts.updated += note_deltas.updated
         note_counts.unchanged += note_deltas.unchanged
+        if note_deltas.diff_details:
+            for d in note_deltas.diff_details:
+                note_counts.add_detail(d)
 
     conn.commit()
 
@@ -633,6 +681,48 @@ def sync_zotero(
         ),
         f"| **Total** | **{total_added}** | **{total_updated}** | **{total_unchanged}** | **{total_changed}** |",
     ]
+
+    # Build diff detail report for annotations and notes
+    all_details: list[_DiffDetail] = []
+    if annotation_counts.diff_details:
+        all_details.extend(annotation_counts.diff_details)
+    if note_counts.diff_details:
+        all_details.extend(note_counts.diff_details)
+
+    if all_details:
+        # Group by title
+        by_title: dict[str, list[_DiffDetail]] = {}
+        for d in all_details:
+            by_title.setdefault(d.title, []).append(d)
+
+        lines.append("")
+        lines.append("### What changed")
+        for title, details in by_title.items():
+            annotations = [d for d in details if d.kind == "annotation"]
+            notes = [d for d in details if d.kind == "note"]
+            parts: list[str] = []
+            if annotations:
+                added = [d for d in annotations if d.outcome == "added"]
+                updated = [d for d in annotations if d.outcome == "updated"]
+                if added:
+                    pages = [d.page for d in added if d.page]
+                    page_str = f" (p. {', '.join(pages)})" if pages else ""
+                    parts.append(f"{len(added)} new annotation{'s' if len(added) != 1 else ''}{page_str}")
+                if updated:
+                    parts.append(f"{len(updated)} updated annotation{'s' if len(updated) != 1 else ''}")
+            if notes:
+                added_n = [d for d in notes if d.outcome == "added"]
+                updated_n = [d for d in notes if d.outcome == "updated"]
+                if added_n:
+                    parts.append(f"{len(added_n)} new note{'s' if len(added_n) != 1 else ''}")
+                if updated_n:
+                    parts.append(f"{len(updated_n)} updated note{'s' if len(updated_n) != 1 else ''}")
+            lines.append(f"- **{title[:70]}**: {', '.join(parts)}")
+            for d in details:
+                if d.excerpt and d.outcome == "added":
+                    page_info = f"p. {d.page}: " if d.page else ""
+                    lines.append(f"  - {page_info}{d.excerpt}")
+
     return "\n".join(lines)
 
 
