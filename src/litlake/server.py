@@ -635,6 +635,114 @@ def preview_document_pdf_pages(
     return CallToolResult(content=content)
 
 
+@mcp.tool(
+    name="get_passage_context",
+    description=(
+        "Get the surrounding context for a passage found by semantic search. "
+        "Provide a document_id from a search result to see the text before and after. "
+        "Use 'window' for a number of surrounding segments (default 2), "
+        "'pages' to get all text from a page range (e.g. pages=1 for the same page, "
+        "pages=2 for ±1 page), or both. "
+        "Useful when the user asks to 'show more', 'what comes before/after', "
+        "'show me the whole page', or 'give me more context'."
+    ),
+    annotations=ToolAnnotations(title="Get Passage Context", readOnlyHint=True, destructiveHint=False),
+)
+def get_passage_context(
+    document_id: int,
+    ctx: Context,
+    window: int | None = None,
+    pages: int | None = None,
+) -> str:
+    state = _state(ctx)
+
+    with state.conn_lock:
+        # Get the target chunk
+        target = state.conn.execute(
+            """
+            SELECT id, document_file_id, chunk_index, content,
+                   json_extract(metadata_json, '$.loc.page_start') as page_start,
+                   json_extract(metadata_json, '$.loc.page_end') as page_end,
+                   reference_id
+            FROM documents
+            WHERE id = ? AND kind = 'fulltext_chunk'
+            """,
+            (document_id,),
+        ).fetchone()
+
+        if not target:
+            raise ValueError(f"No fulltext_chunk found for document_id={document_id}")
+
+        doc_file_id = target[1]
+        chunk_index = int(target[2])
+        target_content = target[3]
+        page_start = int(target[4]) if target[4] is not None else None
+        page_end = int(target[5]) if target[5] is not None else None
+        reference_id = int(target[6])
+
+        # Get title for context header
+        ref_row = state.conn.execute(
+            "SELECT title FROM reference_items WHERE id = ?", (reference_id,)
+        ).fetchone()
+        title = ref_row[0] if ref_row else "(unknown)"
+
+        if pages is not None and page_start is not None:
+            # Page-based context: get all chunks overlapping the page range
+            page_radius = max(0, pages - 1)
+            p_min = page_start - page_radius
+            p_max = (page_end or page_start) + page_radius
+            rows = state.conn.execute(
+                """
+                SELECT chunk_index, content,
+                       json_extract(metadata_json, '$.loc.page_start') as ps
+                FROM documents
+                WHERE document_file_id = ? AND kind = 'fulltext_chunk'
+                AND CAST(json_extract(metadata_json, '$.loc.page_start') AS INTEGER) >= ?
+                AND CAST(json_extract(metadata_json, '$.loc.page_start') AS INTEGER) <= ?
+                ORDER BY chunk_index
+                """,
+                (doc_file_id, p_min, p_max),
+            ).fetchall()
+        else:
+            # Window-based context: get chunks by index proximity
+            w = window if window is not None else 2
+            idx_min = max(0, chunk_index - w)
+            idx_max = chunk_index + w
+            rows = state.conn.execute(
+                """
+                SELECT chunk_index, content,
+                       json_extract(metadata_json, '$.loc.page_start') as ps
+                FROM documents
+                WHERE document_file_id = ? AND kind = 'fulltext_chunk'
+                AND chunk_index >= ? AND chunk_index <= ?
+                ORDER BY chunk_index
+                """,
+                (doc_file_id, idx_min, idx_max),
+            ).fetchall()
+
+    if not rows:
+        return target_content or ""
+
+    # Build output with page markers
+    parts: list[str] = []
+    parts.append(f"**{title}**")
+    current_page: int | None = None
+    for row in rows:
+        ci = int(row[0])
+        content = row[1] or ""
+        ps = int(row[2]) if row[2] is not None else None
+        if ps is not None and ps != current_page:
+            parts.append(f"\n--- p. {ps} ---")
+            current_page = ps
+        # Mark the target chunk
+        if ci == chunk_index:
+            parts.append(f">>> {content} <<<")
+        else:
+            parts.append(content)
+
+    return "\n\n".join(parts)
+
+
 def main() -> None:
     mcp.run(transport="stdio")
 
