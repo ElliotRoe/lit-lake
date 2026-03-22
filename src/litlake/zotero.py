@@ -116,6 +116,7 @@ class ZoteroReader:
                     FROM itemCreators ic
                     JOIN creators c ON ic.creatorID = c.creatorID
                     WHERE ic.itemID = i.itemID
+                    ORDER BY ic.orderIndex
                 ) as authors
             FROM items i
             JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
