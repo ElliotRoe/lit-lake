@@ -104,19 +104,21 @@ class ZoteroReader:
                 abstract_val.value as abstract,
                 SUBSTR(date_val.value, 1, 4) as date,
                 (
-                    SELECT GROUP_CONCAT(
-                        CASE
-                            WHEN c.firstName IS NOT NULL AND c.lastName IS NOT NULL
-                            THEN c.lastName || ', ' || c.firstName
-                            WHEN c.lastName IS NOT NULL
-                            THEN c.lastName
-                            ELSE NULL
-                        END, '; '
+                    SELECT GROUP_CONCAT(author_str, '; ')
+                    FROM (
+                        SELECT
+                            CASE
+                                WHEN c.firstName IS NOT NULL AND c.lastName IS NOT NULL
+                                THEN c.lastName || ', ' || c.firstName
+                                WHEN c.lastName IS NOT NULL
+                                THEN c.lastName
+                                ELSE NULL
+                            END AS author_str
+                        FROM itemCreators ic
+                        JOIN creators c ON ic.creatorID = c.creatorID
+                        WHERE ic.itemID = i.itemID
+                        ORDER BY ic.orderIndex
                     )
-                    FROM itemCreators ic
-                    JOIN creators c ON ic.creatorID = c.creatorID
-                    WHERE ic.itemID = i.itemID
-                    ORDER BY ic.orderIndex
                 ) as authors
             FROM items i
             JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
