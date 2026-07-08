@@ -7,7 +7,7 @@ from typing import Any
 
 from litlake.db import enqueue_job
 from litlake.providers.extraction import SUPPORTED_EXTRACTION_MIME_TYPES, extract_html_text
-from litlake.zotero import ZoteroAnnotation, ZoteroItem, ZoteroReader
+from litlake.zotero import ZoteroAnnotation, ZoteroCollection, ZoteroCollectionMembership, ZoteroItem, ZoteroReader
 
 
 def _to_json(value: dict[str, Any] | None) -> str | None:
@@ -31,10 +31,21 @@ def _note_html_to_text(note_html: str | None) -> str | None:
 
 
 @dataclass
+class _DiffDetail:
+    """One added or updated annotation/note."""
+    title: str
+    kind: str  # 'annotation' or 'note'
+    outcome: str  # 'added' or 'updated'
+    page: str | None = None
+    excerpt: str | None = None
+
+
+@dataclass
 class _DeltaCounts:
     added: int = 0
     updated: int = 0
     unchanged: int = 0
+    diff_details: list[_DiffDetail] | None = None
 
     def record(self, outcome: str) -> None:
         if outcome == "added":
@@ -47,6 +58,11 @@ class _DeltaCounts:
             self.unchanged += 1
             return
         raise ValueError(f"Unsupported delta outcome: {outcome}")
+
+    def add_detail(self, detail: _DiffDetail) -> None:
+        if self.diff_details is None:
+            self.diff_details = []
+        self.diff_details.append(detail)
 
     @property
     def changed(self) -> int:
@@ -266,16 +282,33 @@ def _upsert_annotation_documents(
             if annotation.parent_attachment_key
             else None
         )
+        content = _build_annotation_content(annotation)
         outcome = _upsert_document(
             conn,
             reference_id=reference_id,
             kind="annotation",
             source_id=annotation.key,
-            content=_build_annotation_content(annotation),
+            content=content,
             document_file_id=document_file_id,
             metadata=metadata,
         )
         counts.record(outcome)
+        if outcome in ("added", "updated"):
+            text_excerpt = (annotation.text or "")[:80].strip()
+            comment_excerpt = (annotation.comment or "")[:80].strip()
+            if text_excerpt and comment_excerpt:
+                excerpt = f"{text_excerpt}... // {comment_excerpt}"
+            elif comment_excerpt:
+                excerpt = f"[comment] {comment_excerpt}"
+            else:
+                excerpt = text_excerpt if text_excerpt else None
+            counts.add_detail(_DiffDetail(
+                title=item.title or "(untitled)",
+                kind="annotation",
+                outcome=outcome,
+                page=annotation.page_label,
+                excerpt=excerpt,
+            ))
     return counts
 
 
@@ -289,16 +322,136 @@ def _upsert_note_documents(
             "title": note.title,
             "parent_item_id": note.parent_item_id,
         }
+        content = _note_html_to_text(note.note_html)
         outcome = _upsert_document(
             conn,
             reference_id=reference_id,
             kind="note",
             source_id=note.key,
-            content=_note_html_to_text(note.note_html),
+            content=content,
             metadata=metadata,
         )
         counts.record(outcome)
+        if outcome in ("added", "updated"):
+            excerpt = (content or "")[:80].strip()
+            counts.add_detail(_DiffDetail(
+                title=item.title or "(untitled)",
+                kind="note",
+                outcome=outcome,
+                excerpt=excerpt if excerpt else None,
+            ))
     return counts
+
+
+
+def _sync_collections(
+    conn: sqlite3.Connection,
+    collections: list[ZoteroCollection],
+    memberships: list[ZoteroCollectionMembership],
+    zotero_key_to_reference_id: dict[str, int],
+) -> None:
+    """Upsert Zotero collections and their item memberships into Lit Lake DB."""
+
+    # Upsert collections
+    for col in collections:
+        existing = conn.execute(
+            "SELECT id FROM collections WHERE zotero_collection_id = ?",
+            (col.collection_id,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE collections
+                SET name = ?, parent_zotero_collection_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE zotero_collection_id = ?
+                """,
+                (col.name, col.parent_collection_id, col.collection_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO collections (zotero_collection_id, zotero_key, name, parent_zotero_collection_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (col.collection_id, col.key, col.name, col.parent_collection_id),
+            )
+
+    # Rebuild collection_items from scratch (simple & correct)
+    conn.execute("DELETE FROM collection_items")
+
+    # Build lookup: zotero_item_id -> reference_id via zotero_key
+    # We need zotero_item_id -> zotero_key mapping from Zotero DB
+    # memberships use item_id (Zotero internal), we need reference_id
+    # Use reference_external_ids to map zotero item key -> reference_id
+    # But memberships only have item_id, not key — we need to join via reference_external_ids source_id
+    # source_id in reference_items = zotero key; in reference_external_ids scheme='zotero_key' value=key
+    # We stored zotero item_id nowhere directly — use source_id on reference_items which is the key
+    # We need item_id -> key mapping: query Zotero DB for that
+
+    # Build collection_id lookup
+    col_id_map = {}
+    for row in conn.execute("SELECT id, zotero_collection_id FROM collections").fetchall():
+        col_id_map[int(row[1])] = int(row[0])
+
+    # Build zotero_item_id -> reference_id map via reference_items.source_id
+    # reference_items.source_id = zotero item key (string)
+    # memberships have item_id (integer) — we need a bridge
+    # Query reference_external_ids: scheme='zotero_key', value=item_key
+    # But we only have item_id integers in memberships, not keys
+    # Solution: store item_id->key mapping from ZoteroReader
+    pass  # handled below via zotero_item_id_to_reference_id passed in
+
+
+def _sync_collections_with_ids(
+    conn: sqlite3.Connection,
+    collections: list[ZoteroCollection],
+    memberships: list[ZoteroCollectionMembership],
+    zotero_item_id_to_reference_id: dict[int, int],
+) -> None:
+    """Upsert Zotero collections and their item memberships into Lit Lake DB."""
+
+    # Upsert collections
+    for col in collections:
+        existing = conn.execute(
+            "SELECT id FROM collections WHERE zotero_collection_id = ?",
+            (col.collection_id,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE collections
+                SET name = ?, parent_zotero_collection_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE zotero_collection_id = ?
+                """,
+                (col.name, col.parent_collection_id, col.collection_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO collections (zotero_collection_id, zotero_key, name, parent_zotero_collection_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (col.collection_id, col.key, col.name, col.parent_collection_id),
+            )
+
+    # Rebuild collection_items
+    conn.execute("DELETE FROM collection_items")
+    col_id_map = {
+        int(row[1]): int(row[0])
+        for row in conn.execute("SELECT id, zotero_collection_id FROM collections").fetchall()
+    }
+    for membership in memberships:
+        collection_db_id = col_id_map.get(membership.collection_id)
+        reference_id = zotero_item_id_to_reference_id.get(membership.item_id)
+        if collection_db_id is None or reference_id is None:
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO collection_items (collection_id, reference_id)
+            VALUES (?, ?)
+            """,
+            (collection_db_id, reference_id),
+        )
 
 
 def sync_zotero(
@@ -309,6 +462,7 @@ def sync_zotero(
 ) -> str:
     reader = ZoteroReader(explicit_db_path)
     items = reader.get_items()
+    collections, memberships = reader.get_collections()
 
     existing_map_rows = conn.execute(
         "SELECT value, reference_id FROM reference_external_ids WHERE scheme = 'zotero_key'"
@@ -401,11 +555,22 @@ def sync_zotero(
         annotation_counts.added += annotation_deltas.added
         annotation_counts.updated += annotation_deltas.updated
         annotation_counts.unchanged += annotation_deltas.unchanged
+        if annotation_deltas.diff_details:
+            for d in annotation_deltas.diff_details:
+                annotation_counts.add_detail(d)
         note_deltas = _upsert_note_documents(conn, reference_id=reference_id, item=item)
         note_counts.added += note_deltas.added
         note_counts.updated += note_deltas.updated
         note_counts.unchanged += note_deltas.unchanged
+        if note_deltas.diff_details:
+            for d in note_deltas.diff_details:
+                note_counts.add_detail(d)
 
+    conn.commit()
+
+    # Sync collections
+    zotero_item_id_to_reference_id = {item.item_id: existing_map[item.key] for item in items if item.key in existing_map}
+    _sync_collections_with_ids(conn, collections, memberships, zotero_item_id_to_reference_id)
     conn.commit()
 
     embeddable_kinds = ("title", "abstract", "fulltext_chunk", "annotation", "note")
@@ -516,6 +681,48 @@ def sync_zotero(
         ),
         f"| **Total** | **{total_added}** | **{total_updated}** | **{total_unchanged}** | **{total_changed}** |",
     ]
+
+    # Build diff detail report for annotations and notes
+    all_details: list[_DiffDetail] = []
+    if annotation_counts.diff_details:
+        all_details.extend(annotation_counts.diff_details)
+    if note_counts.diff_details:
+        all_details.extend(note_counts.diff_details)
+
+    if all_details:
+        # Group by title
+        by_title: dict[str, list[_DiffDetail]] = {}
+        for d in all_details:
+            by_title.setdefault(d.title, []).append(d)
+
+        lines.append("")
+        lines.append("### What changed")
+        for title, details in by_title.items():
+            annotations = [d for d in details if d.kind == "annotation"]
+            notes = [d for d in details if d.kind == "note"]
+            parts: list[str] = []
+            if annotations:
+                added = [d for d in annotations if d.outcome == "added"]
+                updated = [d for d in annotations if d.outcome == "updated"]
+                if added:
+                    pages = [d.page for d in added if d.page]
+                    page_str = f" (p. {', '.join(pages)})" if pages else ""
+                    parts.append(f"{len(added)} new annotation{'s' if len(added) != 1 else ''}{page_str}")
+                if updated:
+                    parts.append(f"{len(updated)} updated annotation{'s' if len(updated) != 1 else ''}")
+            if notes:
+                added_n = [d for d in notes if d.outcome == "added"]
+                updated_n = [d for d in notes if d.outcome == "updated"]
+                if added_n:
+                    parts.append(f"{len(added_n)} new note{'s' if len(added_n) != 1 else ''}")
+                if updated_n:
+                    parts.append(f"{len(updated_n)} updated note{'s' if len(updated_n) != 1 else ''}")
+            lines.append(f"- **{title[:70]}**: {', '.join(parts)}")
+            for d in details:
+                if d.excerpt and d.outcome == "added":
+                    page_info = f"p. {d.page}: " if d.page else ""
+                    lines.append(f"  - {page_info}{d.excerpt}")
+
     return "\n".join(lines)
 
 
