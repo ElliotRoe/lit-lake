@@ -134,12 +134,14 @@ def _background_init(state: AppState) -> None:
                 ",".join(sorted(extraction_providers[0].supported_mime_types)),
             )
 
-            state.init_message = InitStatus.LOADING_EMBED
-            embedding_provider = _select_embedding_provider(state.settings)
+        # Model loading OUTSIDE the lock so sync_zotero_tool can proceed
+        state.init_message = InitStatus.LOADING_EMBED
+        embedding_provider = _select_embedding_provider(state.settings)
 
-            state.init_message = InitStatus.LOADING_RERANK
-            rerank_provider = _select_rerank_provider(state.settings)
+        state.init_message = InitStatus.LOADING_RERANK
+        rerank_provider = _select_rerank_provider(state.settings)
 
+        with state.conn_lock:
             register_ai_functions(state.conn, embedding_provider, rerank_provider)
 
         queue_policy = QueuePolicy(
@@ -285,20 +287,35 @@ def _resolve_claude_mcp_log_path() -> Path | None:
     annotations=ToolAnnotations(title="Sync Zotero Library", readOnlyHint=False, destructiveHint=False),
 )
 def sync_zotero_tool(ctx: Context) -> str:
+    import time
     state = _state(ctx)
-    with state.conn_lock:
-        result = sync_zotero(
-            state.conn,
-            queue_max_attempts=state.settings.queue_max_attempts,
-            explicit_db_path=state.settings.zotero_db_path,
-        )
+    last_exc = None
+    for attempt in range(10):
+        try:
+            sync_conn = connect_db(state.settings.paths.db_path)
+            try:
+                result = sync_zotero(
+                    sync_conn,
+                    queue_max_attempts=state.settings.queue_max_attempts,
+                    explicit_db_path=state.settings.zotero_db_path,
+                )
+            finally:
+                sync_conn.close()
 
-    if state.embedding_worker is not None:
-        state.embedding_worker.wake()
-    if state.extraction_worker is not None:
-        state.extraction_worker.wake()
+            if state.embedding_worker is not None:
+                state.embedding_worker.wake()
+            if state.extraction_worker is not None:
+                state.extraction_worker.wake()
 
-    return result
+            return result
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("sync_zotero_tool attempt %d failed: %s", attempt, exc)
+            if "locked" in str(exc).lower():
+                time.sleep(2)
+                continue
+            raise
+    raise last_exc
 
 
 @mcp.tool(
@@ -449,6 +466,56 @@ def library_status(ctx: Context) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+
+@mcp.tool(
+    name="list_collections",
+    description=(
+        "List all Zotero collections (folders) with their hierarchy. "
+        "Returns collection names, IDs, and parent-child relationships. "
+        "Use collection_id with sql_search to filter references by collection, e.g.: "
+        "SELECT r.* FROM reference_items r "
+        "JOIN collection_items ci ON ci.reference_id = r.id "
+        "JOIN collections c ON c.id = ci.collection_id "
+        "WHERE c.id = <collection_id>"
+    ),
+    annotations=ToolAnnotations(title="List Zotero Collections", readOnlyHint=True, destructiveHint=False),
+)
+def list_collections(ctx: Context) -> str:
+    import json
+    state = _state(ctx)
+    with state.conn_lock:
+        collections = state.conn.execute(
+            """
+            SELECT
+                c.id,
+                c.zotero_collection_id,
+                c.name,
+                c.parent_zotero_collection_id,
+                p.id as parent_id,
+                p.name as parent_name,
+                COUNT(ci.reference_id) as item_count
+            FROM collections c
+            LEFT JOIN collections p ON p.zotero_collection_id = c.parent_zotero_collection_id
+            LEFT JOIN collection_items ci ON ci.collection_id = c.id
+            GROUP BY c.id
+            ORDER BY COALESCE(p.name, c.name), c.name
+            """
+        ).fetchall()
+
+    result = [
+        {
+            "id": int(row[0]),
+            "zotero_collection_id": row[1],
+            "name": row[2],
+            "parent_id": int(row[4]) if row[4] is not None else None,
+            "parent_name": row[5],
+            "item_count": int(row[6]),
+        }
+        for row in collections
+    ]
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
 @mcp.tool(
     name="get_debug_log_path",
     description=(
@@ -574,3 +641,165 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@mcp.tool()
+def annotate_pdf_chunks(ctx: Context, 
+    reference_id: int,
+    chunk_indices: list[int],
+    color: tuple[float, float, float] = (1.0, 0.8, 0.0),
+    label: str = "",
+) -> CallToolResult:
+    """Highlight specific chunks in a PDF file using PyMuPDF.
+
+    Writes highlight annotations directly into the PDF file so they appear
+    when opening in Zotero or any PDF viewer. This is a temporary solution
+    until the Zotero 7 local API is available.
+
+    Zotero may be open. Reload the PDF in Zotero to show new annotations.
+    To edit annotations in Zotero, use File → Import Annotations after reloading.
+
+    Args:
+        reference_id: The reference item ID from the database.
+        chunk_indices: List of chunk_index values to highlight.
+        color: RGB color tuple (0.0-1.0) for the highlight. Default: yellow.
+        label: Optional label/comment to attach to each annotation.
+
+    SQL to find chunk indices:
+        SELECT d.chunk_index, d.content, json_extract(d.metadata_json, '$.loc.page_start') as page
+        FROM documents d
+        JOIN document_files df ON df.id = d.document_file_id
+        WHERE df.reference_id = <reference_id>
+        AND d.kind = 'fulltext_chunk'
+        ORDER BY d.chunk_index;
+    """
+    import fitz
+
+    state = _state(ctx)
+    db = connect_db(state.settings.paths.db_path)
+
+    row = db.execute(
+        "SELECT df.file_path FROM document_files df WHERE df.reference_id = ? AND df.mime_type = 'application/pdf' LIMIT 1",
+        (reference_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError(f"No PDF found for reference_id={reference_id}")
+    file_path = row[0]
+
+    chunks = db.execute(
+        f"""
+        SELECT d.chunk_index, d.content,
+               json_extract(d.metadata_json, '$.loc.page_start') as page_start,
+               json_extract(d.metadata_json, '$.loc.page_end') as page_end
+        FROM documents d
+        JOIN document_files df ON df.id = d.document_file_id
+        WHERE df.reference_id = ? AND d.kind = 'fulltext_chunk'
+        AND d.chunk_index IN ({','.join('?' * len(chunk_indices))})
+        """,
+        (reference_id, *chunk_indices),
+    ).fetchall()
+
+    if not chunks:
+        raise ValueError(f"No chunks found for reference_id={reference_id} with indices={chunk_indices}")
+
+    doc = fitz.open(file_path)
+    highlighted = 0
+
+    try:
+        for chunk_index, content, page_start, page_end in chunks:
+            if page_start is None:
+                continue
+            start_idx = max(0, int(page_start) - 1)
+            end_idx = min(int(page_end) if page_end else int(page_start), len(doc) - 1)
+            words = content.split()
+            mid = len(words) // 2
+            search_text = " ".join(words[max(0, mid - 8):mid + 8]).strip()
+
+            for page_idx in range(start_idx, end_idx + 1):
+                page = doc[page_idx]
+                instances = page.search_for(search_text)
+                if not instances:
+                    search_text = " ".join(words[2:12]).strip()
+                    instances = page.search_for(search_text)
+                if instances:
+                    annot = page.add_highlight_annot(instances)
+                    annot.set_colors(stroke=color)
+                    if label:
+                        annot.set_info(content=label)
+                    annot.update()
+                    highlighted += 1
+                    break
+
+        doc.save(file_path, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+    finally:
+        doc.close()
+
+    return CallToolResult(
+        content=[TextContent(type="text", text=f"Highlighted {highlighted}/{len(chunks)} chunks in {file_path}")]
+    )
+
+
+@mcp.tool()
+def annotate_quotes(
+    ctx: Context,
+    reference_id: int,
+    quotes: list[str],
+    color: tuple[float, float, float] = (0.0, 0.8, 0.0),
+    label: str = "",
+) -> CallToolResult:
+    """Highlight exact quote strings in a PDF file using PyMuPDF.
+
+    Searches for each quote string in the PDF and highlights all matches.
+    More precise than chunk-based annotation.
+
+    Note: quotes containing typographic characters (e.g. curly quotes, typographic
+    apostrophes, or em-dashes) may not be found if the PDF uses different encoding.
+    PyMuPDF will match up to the problematic character and stop. To work around
+    this, shorten the quote to end before the problematic character.
+    Example: use "the company changed its strategy" instead of
+    "the company changed its strategy’s outcome".
+
+    Args:
+        reference_id: The reference item ID from the database.
+        quotes: List of exact quote strings to search for and highlight.
+        color: RGB color tuple (0.0-1.0). Default: green.
+        label: Optional comment to attach to each annotation.
+    """
+    import fitz
+
+    state = _state(ctx)
+    db = connect_db(state.settings.paths.db_path)
+
+    row = db.execute(
+        "SELECT file_path FROM document_files WHERE reference_id = ? AND mime_type = 'application/pdf' LIMIT 1",
+        (reference_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError(f"No PDF found for reference_id={reference_id}")
+    file_path = row[0]
+
+    doc = fitz.open(file_path)
+    results = []
+
+    try:
+        for quote in quotes:
+            found = False
+            for page in doc:
+                instances = page.search_for(quote)
+                if instances:
+                    annot = page.add_highlight_annot(instances)
+                    annot.set_colors(stroke=color)
+                    if label:
+                        annot.set_info(content=label)
+                    annot.update()
+                    found = True
+                    break
+            results.append(f"{'✅' if found else '❌'} {quote[:60]}...")
+
+        doc.save(file_path, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+    finally:
+        doc.close()
+
+    return CallToolResult(
+        content=[TextContent(type="text", text="\n".join(results))]
+    )
