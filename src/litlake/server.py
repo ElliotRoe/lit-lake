@@ -134,12 +134,14 @@ def _background_init(state: AppState) -> None:
                 ",".join(sorted(extraction_providers[0].supported_mime_types)),
             )
 
-            state.init_message = InitStatus.LOADING_EMBED
-            embedding_provider = _select_embedding_provider(state.settings)
+        # Model loading OUTSIDE the lock so sync_zotero_tool can proceed
+        state.init_message = InitStatus.LOADING_EMBED
+        embedding_provider = _select_embedding_provider(state.settings)
 
-            state.init_message = InitStatus.LOADING_RERANK
-            rerank_provider = _select_rerank_provider(state.settings)
+        state.init_message = InitStatus.LOADING_RERANK
+        rerank_provider = _select_rerank_provider(state.settings)
 
+        with state.conn_lock:
             register_ai_functions(state.conn, embedding_provider, rerank_provider)
 
         queue_policy = QueuePolicy(
@@ -285,20 +287,35 @@ def _resolve_claude_mcp_log_path() -> Path | None:
     annotations=ToolAnnotations(title="Sync Zotero Library", readOnlyHint=False, destructiveHint=False),
 )
 def sync_zotero_tool(ctx: Context) -> str:
+    import time
     state = _state(ctx)
-    with state.conn_lock:
-        result = sync_zotero(
-            state.conn,
-            queue_max_attempts=state.settings.queue_max_attempts,
-            explicit_db_path=state.settings.zotero_db_path,
-        )
+    last_exc = None
+    for attempt in range(10):
+        try:
+            sync_conn = connect_db(state.settings.paths.db_path)
+            try:
+                result = sync_zotero(
+                    sync_conn,
+                    queue_max_attempts=state.settings.queue_max_attempts,
+                    explicit_db_path=state.settings.zotero_db_path,
+                )
+            finally:
+                sync_conn.close()
 
-    if state.embedding_worker is not None:
-        state.embedding_worker.wake()
-    if state.extraction_worker is not None:
-        state.extraction_worker.wake()
+            if state.embedding_worker is not None:
+                state.embedding_worker.wake()
+            if state.extraction_worker is not None:
+                state.extraction_worker.wake()
 
-    return result
+            return result
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("sync_zotero_tool attempt %d failed: %s", attempt, exc)
+            if "locked" in str(exc).lower():
+                time.sleep(2)
+                continue
+            raise
+    raise last_exc
 
 
 @mcp.tool(
@@ -449,6 +466,56 @@ def library_status(ctx: Context) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+
+@mcp.tool(
+    name="list_collections",
+    description=(
+        "List all Zotero collections (folders) with their hierarchy. "
+        "Returns collection names, IDs, and parent-child relationships. "
+        "Use collection_id with sql_search to filter references by collection, e.g.: "
+        "SELECT r.* FROM reference_items r "
+        "JOIN collection_items ci ON ci.reference_id = r.id "
+        "JOIN collections c ON c.id = ci.collection_id "
+        "WHERE c.id = <collection_id>"
+    ),
+    annotations=ToolAnnotations(title="List Zotero Collections", readOnlyHint=True, destructiveHint=False),
+)
+def list_collections(ctx: Context) -> str:
+    import json
+    state = _state(ctx)
+    with state.conn_lock:
+        collections = state.conn.execute(
+            """
+            SELECT
+                c.id,
+                c.zotero_collection_id,
+                c.name,
+                c.parent_zotero_collection_id,
+                p.id as parent_id,
+                p.name as parent_name,
+                COUNT(ci.reference_id) as item_count
+            FROM collections c
+            LEFT JOIN collections p ON p.zotero_collection_id = c.parent_zotero_collection_id
+            LEFT JOIN collection_items ci ON ci.collection_id = c.id
+            GROUP BY c.id
+            ORDER BY COALESCE(p.name, c.name), c.name
+            """
+        ).fetchall()
+
+    result = [
+        {
+            "id": int(row[0]),
+            "zotero_collection_id": row[1],
+            "name": row[2],
+            "parent_id": int(row[4]) if row[4] is not None else None,
+            "parent_name": row[5],
+            "item_count": int(row[6]),
+        }
+        for row in collections
+    ]
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
 @mcp.tool(
     name="get_debug_log_path",
     description=(
@@ -574,3 +641,313 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@mcp.tool()
+def annotate_pdf_chunks(ctx: Context, 
+    reference_id: int,
+    chunk_indices: list[int],
+    color: tuple[float, float, float] = (1.0, 0.8, 0.0),
+    label: str = "",
+) -> CallToolResult:
+    """Highlight specific chunks in a PDF file using PyMuPDF.
+
+    Writes highlight annotations directly into the PDF file so they appear
+    when opening in Zotero or any PDF viewer. This is a temporary solution
+    until the Zotero 7 local API is available.
+
+    Zotero may be open. Reload the PDF in Zotero to show new annotations.
+    To edit annotations in Zotero, use File → Import Annotations after reloading.
+
+    Args:
+        reference_id: The reference item ID from the database.
+        chunk_indices: List of chunk_index values to highlight.
+        color: RGB color tuple (0.0-1.0) for the highlight. Default: yellow.
+        label: Optional label/comment to attach to each annotation.
+
+    SQL to find chunk indices:
+        SELECT d.chunk_index, d.content, json_extract(d.metadata_json, '$.loc.page_start') as page
+        FROM documents d
+        JOIN document_files df ON df.id = d.document_file_id
+        WHERE df.reference_id = <reference_id>
+        AND d.kind = 'fulltext_chunk'
+        ORDER BY d.chunk_index;
+    """
+    import fitz
+
+    state = _state(ctx)
+    db = connect_db(state.settings.paths.db_path)
+
+    row = db.execute(
+        "SELECT df.file_path FROM document_files df WHERE df.reference_id = ? AND df.mime_type = 'application/pdf' LIMIT 1",
+        (reference_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError(f"No PDF found for reference_id={reference_id}")
+    file_path = row[0]
+
+    chunks = db.execute(
+        f"""
+        SELECT d.chunk_index, d.content,
+               json_extract(d.metadata_json, '$.loc.page_start') as page_start,
+               json_extract(d.metadata_json, '$.loc.page_end') as page_end
+        FROM documents d
+        JOIN document_files df ON df.id = d.document_file_id
+        WHERE df.reference_id = ? AND d.kind = 'fulltext_chunk'
+        AND d.chunk_index IN ({','.join('?' * len(chunk_indices))})
+        """,
+        (reference_id, *chunk_indices),
+    ).fetchall()
+
+    if not chunks:
+        raise ValueError(f"No chunks found for reference_id={reference_id} with indices={chunk_indices}")
+
+    doc = fitz.open(file_path)
+    highlighted = 0
+
+    try:
+        for chunk_index, content, page_start, page_end in chunks:
+            if page_start is None:
+                continue
+            start_idx = max(0, int(page_start) - 1)
+            end_idx = min(int(page_end) if page_end else int(page_start), len(doc) - 1)
+            words = content.split()
+            mid = len(words) // 2
+            search_text = " ".join(words[max(0, mid - 8):mid + 8]).strip()
+
+            for page_idx in range(start_idx, end_idx + 1):
+                page = doc[page_idx]
+                instances = page.search_for(search_text)
+                if not instances:
+                    search_text = " ".join(words[2:12]).strip()
+                    instances = page.search_for(search_text)
+                if instances:
+                    annot = page.add_highlight_annot(instances)
+                    annot.set_colors(stroke=color)
+                    if label:
+                        annot.set_info(content=label)
+                    annot.update()
+                    highlighted += 1
+                    break
+
+        doc.save(file_path, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+    finally:
+        doc.close()
+
+    return CallToolResult(
+        content=[TextContent(type="text", text=f"Highlighted {highlighted}/{len(chunks)} chunks in {file_path}")]
+    )
+
+
+def _build_page_label_map(doc) -> dict[str, int]:
+    """Build a mapping from page label (book page number) to PDF page index (0-based)."""
+    label_map: dict[str, int] = {}
+    for page_idx in range(len(doc)):
+        label = doc[page_idx].get_label()
+        if label:
+            label_map[label] = page_idx
+    return label_map
+
+
+def _resolve_expected_page(
+    page_num: int,
+    doc,
+    label_map: dict[str, int],
+    tolerance: int,
+) -> tuple[range, str, bool]:
+    """Resolve a user-provided page number to a range of PDF page indices.
+
+    First tries page labels (book page numbers), then falls back to raw PDF pages.
+    Returns (search_range, scope_description, used_labels).
+    """
+    label_str = str(page_num)
+    if label_str in label_map:
+        # Found in page labels: this is a book page number
+        center_idx = label_map[label_str]
+        p_min = max(0, center_idx - tolerance)
+        p_max = min(len(doc) - 1, center_idx + tolerance)
+        book_label = label_str
+        pdf_page = center_idx + 1
+        scope = f"book p. {book_label} (PDF p. {pdf_page}) \u00b1{tolerance}"
+        return range(p_min, p_max + 1), scope, True
+
+    # No label match: treat as raw PDF page number
+    center_idx = page_num - 1  # 0-indexed
+    p_min = max(0, center_idx - tolerance)
+    p_max = min(len(doc) - 1, center_idx + tolerance)
+    scope = f"PDF p. {page_num} \u00b1{tolerance} (no page labels)"
+    return range(p_min, p_max + 1), scope, False
+
+
+def _format_page_result(page_idx: int, doc, label_map: dict[str, int]) -> str:
+    """Format a page number for output, showing both book and PDF page if labels exist."""
+    label = doc[page_idx].get_label()
+    pdf_page = page_idx + 1
+    if label and label != str(pdf_page):
+        return f"p. {label} (PDF p. {pdf_page})"
+    return f"p. {pdf_page}"
+
+
+@mcp.tool()
+def annotate_quotes(
+    ctx: Context,
+    reference_id: int,
+    quotes: list[str],
+    color: tuple[float, float, float] = (0.0, 0.8, 0.0),
+    label: str = "",
+    expected_pages: list[int] | None = None,
+    page_tolerance: int = 2,
+    confidence_threshold: float = 0.6,
+    auto_mark: bool = True,
+) -> CallToolResult:
+    """Highlight exact quote strings in a PDF file using PyMuPDF.
+
+    Searches for each quote string in the PDF and highlights matches.
+    Uses page hints and confidence scoring to avoid false matches.
+    Supports PDF page labels (book page numbers) with automatic fallback
+    to raw PDF page numbers.
+
+    When expected_pages are provided, the tool first tries to match them
+    against the PDF's embedded page labels (e.g. book page 4 -> PDF page 14).
+    If no labels exist, it falls back to treating the number as a PDF page.
+    If no match is found in the label-based window, it also tries the raw
+    PDF page as a second fallback.
+
+    Args:
+        reference_id: The reference item ID from the database.
+        quotes: List of exact quote strings to search for and highlight.
+        color: RGB color tuple (0.0-1.0). Default: green.
+        label: Optional comment to attach to each annotation.
+        expected_pages: Optional list of expected page numbers (book pages),
+            one per quote. Automatically resolved via page labels if available.
+        page_tolerance: Pages around the expected page to search.
+            Default: 2 (searches +/-2 pages).
+        confidence_threshold: Minimum match ratio (0.0-1.0) to auto-mark.
+            Default: 0.6. Below this, the match is reported but not marked.
+        auto_mark: If True (default), marks high-confidence matches.
+            If False, reports all matches without marking any.
+    """
+    import fitz
+
+    state = _state(ctx)
+    db = connect_db(state.settings.paths.db_path)
+
+    row = db.execute(
+        "SELECT file_path FROM document_files WHERE reference_id = ? AND mime_type = 'application/pdf' LIMIT 1",
+        (reference_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError(f"No PDF found for reference_id={reference_id}")
+    file_path = row[0]
+
+    doc = fitz.open(file_path)
+    label_map = _build_page_label_map(doc)
+    has_labels = bool(label_map)
+    results = []
+    marked_count = 0
+
+    try:
+        for i, quote in enumerate(quotes):
+            best_confidence = None
+            best_page_idx = None
+            best_instances = None
+            search_scope = "full PDF"
+
+            if expected_pages and i < len(expected_pages) and expected_pages[i]:
+                page_num = expected_pages[i]
+
+                # Primary: resolve via page labels
+                search_range, scope, used_labels = _resolve_expected_page(
+                    page_num, doc, label_map, page_tolerance,
+                )
+                search_scope = scope
+
+                # Search in primary range
+                for page_idx in search_range:
+                    page = doc[page_idx]
+                    instances = page.search_for(quote)
+                    if instances:
+                        page_text = page.get_text("text")
+                        quote_words = quote.split()
+                        found_words = sum(1 for w in quote_words if w.lower() in page_text.lower())
+                        confidence = found_words / len(quote_words) if quote_words else 0.0
+                        if best_confidence is None or confidence > best_confidence:
+                            best_confidence = confidence
+                            best_page_idx = page_idx
+                            best_instances = instances
+
+                # Fallback: if used labels but found nothing, also try raw PDF page
+                if best_confidence is None and used_labels:
+                    raw_center = page_num - 1  # 0-indexed
+                    raw_min = max(0, raw_center - page_tolerance)
+                    raw_max = min(len(doc) - 1, raw_center + page_tolerance)
+                    fallback_range = range(raw_min, raw_max + 1)
+
+                    for page_idx in fallback_range:
+                        if page_idx in search_range:
+                            continue  # already searched
+                        page = doc[page_idx]
+                        instances = page.search_for(quote)
+                        if instances:
+                            page_text = page.get_text("text")
+                            quote_words = quote.split()
+                            found_words = sum(1 for w in quote_words if w.lower() in page_text.lower())
+                            confidence = found_words / len(quote_words) if quote_words else 0.0
+                            if best_confidence is None or confidence > best_confidence:
+                                best_confidence = confidence
+                                best_page_idx = page_idx
+                                best_instances = instances
+                                search_scope += f" + fallback PDF p. {page_num}"
+            else:
+                # No expected page: search full PDF
+                for page_idx in range(len(doc)):
+                    page = doc[page_idx]
+                    instances = page.search_for(quote)
+                    if instances:
+                        page_text = page.get_text("text")
+                        quote_words = quote.split()
+                        found_words = sum(1 for w in quote_words if w.lower() in page_text.lower())
+                        confidence = found_words / len(quote_words) if quote_words else 0.0
+                        if best_confidence is None or confidence > best_confidence:
+                            best_confidence = confidence
+                            best_page_idx = page_idx
+                            best_instances = instances
+
+            if best_confidence is not None and best_instances is not None and best_page_idx is not None:
+                page_display = _format_page_result(best_page_idx, doc, label_map)
+
+                if best_confidence >= confidence_threshold and auto_mark:
+                    page = doc[best_page_idx]
+                    annot = page.add_highlight_annot(best_instances)
+                    annot.set_colors(stroke=color)
+                    if label:
+                        annot.set_info(content=label)
+                    annot.update()
+                    marked_count += 1
+                    results.append(
+                        f"\u2705 {page_display} (confidence: {best_confidence:.0%}) "
+                        f"{quote[:60]}..."
+                    )
+                else:
+                    results.append(
+                        f"\u2753 {page_display} (confidence: {best_confidence:.0%}, NOT marked) "
+                        f"{quote[:60]}...\n"
+                        f"   Searched: {search_scope}. To force-mark, call annotate_quotes with "
+                        f"expected_pages=[{best_page_idx + 1}] and confidence_threshold={best_confidence:.1f}."
+                    )
+            else:
+                results.append(
+                    f"\u274c Not found in {search_scope}: {quote[:60]}..."
+                )
+
+        if marked_count > 0:
+            doc.save(file_path, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+
+    finally:
+        doc.close()
+
+    label_note = " (page labels detected)" if has_labels else " (no page labels)"
+    header_text = f"Marked {marked_count}/{len(quotes)} quotes in PDF{label_note}."
+    return CallToolResult(
+        content=[TextContent(type="text", text=header_text + "\n\n" + "\n".join(results))]
+    )
