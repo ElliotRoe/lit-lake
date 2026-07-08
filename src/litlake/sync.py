@@ -7,7 +7,7 @@ from typing import Any
 
 from litlake.db import enqueue_job
 from litlake.providers.extraction import SUPPORTED_EXTRACTION_MIME_TYPES, extract_html_text
-from litlake.zotero import ZoteroAnnotation, ZoteroItem, ZoteroReader
+from litlake.zotero import ZoteroAnnotation, ZoteroCollection, ZoteroCollectionMembership, ZoteroItem, ZoteroReader
 
 
 def _to_json(value: dict[str, Any] | None) -> str | None:
@@ -260,6 +260,8 @@ def _upsert_annotation_documents(
             "position": annotation.position,
             "is_external": annotation.is_external,
             "parent_attachment_key": annotation.parent_attachment_key,
+            "date_added": annotation.date_added,
+            "date_modified": annotation.date_modified,
         }
         document_file_id = (
             document_file_ids.get(annotation.parent_attachment_key)
@@ -301,6 +303,117 @@ def _upsert_note_documents(
     return counts
 
 
+
+def _sync_collections(
+    conn: sqlite3.Connection,
+    collections: list[ZoteroCollection],
+    memberships: list[ZoteroCollectionMembership],
+    zotero_key_to_reference_id: dict[str, int],
+) -> None:
+    """Upsert Zotero collections and their item memberships into Lit Lake DB."""
+
+    # Upsert collections
+    for col in collections:
+        existing = conn.execute(
+            "SELECT id FROM collections WHERE zotero_collection_id = ?",
+            (col.collection_id,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE collections
+                SET name = ?, parent_zotero_collection_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE zotero_collection_id = ?
+                """,
+                (col.name, col.parent_collection_id, col.collection_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO collections (zotero_collection_id, zotero_key, name, parent_zotero_collection_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (col.collection_id, col.key, col.name, col.parent_collection_id),
+            )
+
+    # Rebuild collection_items from scratch (simple & correct)
+    conn.execute("DELETE FROM collection_items")
+
+    # Build lookup: zotero_item_id -> reference_id via zotero_key
+    # We need zotero_item_id -> zotero_key mapping from Zotero DB
+    # memberships use item_id (Zotero internal), we need reference_id
+    # Use reference_external_ids to map zotero item key -> reference_id
+    # But memberships only have item_id, not key — we need to join via reference_external_ids source_id
+    # source_id in reference_items = zotero key; in reference_external_ids scheme='zotero_key' value=key
+    # We stored zotero item_id nowhere directly — use source_id on reference_items which is the key
+    # We need item_id -> key mapping: query Zotero DB for that
+
+    # Build collection_id lookup
+    col_id_map = {}
+    for row in conn.execute("SELECT id, zotero_collection_id FROM collections").fetchall():
+        col_id_map[int(row[1])] = int(row[0])
+
+    # Build zotero_item_id -> reference_id map via reference_items.source_id
+    # reference_items.source_id = zotero item key (string)
+    # memberships have item_id (integer) — we need a bridge
+    # Query reference_external_ids: scheme='zotero_key', value=item_key
+    # But we only have item_id integers in memberships, not keys
+    # Solution: store item_id->key mapping from ZoteroReader
+    pass  # handled below via zotero_item_id_to_reference_id passed in
+
+
+def _sync_collections_with_ids(
+    conn: sqlite3.Connection,
+    collections: list[ZoteroCollection],
+    memberships: list[ZoteroCollectionMembership],
+    zotero_item_id_to_reference_id: dict[int, int],
+) -> None:
+    """Upsert Zotero collections and their item memberships into Lit Lake DB."""
+
+    # Upsert collections
+    for col in collections:
+        existing = conn.execute(
+            "SELECT id FROM collections WHERE zotero_collection_id = ?",
+            (col.collection_id,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE collections
+                SET name = ?, parent_zotero_collection_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE zotero_collection_id = ?
+                """,
+                (col.name, col.parent_collection_id, col.collection_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO collections (zotero_collection_id, zotero_key, name, parent_zotero_collection_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (col.collection_id, col.key, col.name, col.parent_collection_id),
+            )
+
+    # Rebuild collection_items
+    conn.execute("DELETE FROM collection_items")
+    col_id_map = {
+        int(row[1]): int(row[0])
+        for row in conn.execute("SELECT id, zotero_collection_id FROM collections").fetchall()
+    }
+    for membership in memberships:
+        collection_db_id = col_id_map.get(membership.collection_id)
+        reference_id = zotero_item_id_to_reference_id.get(membership.item_id)
+        if collection_db_id is None or reference_id is None:
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO collection_items (collection_id, reference_id)
+            VALUES (?, ?)
+            """,
+            (collection_db_id, reference_id),
+        )
+
+
 def sync_zotero(
     conn: sqlite3.Connection,
     *,
@@ -309,6 +422,7 @@ def sync_zotero(
 ) -> str:
     reader = ZoteroReader(explicit_db_path)
     items = reader.get_items()
+    collections, memberships = reader.get_collections()
 
     existing_map_rows = conn.execute(
         "SELECT value, reference_id FROM reference_external_ids WHERE scheme = 'zotero_key'"
@@ -406,6 +520,11 @@ def sync_zotero(
         note_counts.updated += note_deltas.updated
         note_counts.unchanged += note_deltas.unchanged
 
+    conn.commit()
+
+    # Sync collections
+    zotero_item_id_to_reference_id = {item.item_id: existing_map[item.key] for item in items if item.key in existing_map}
+    _sync_collections_with_ids(conn, collections, memberships, zotero_item_id_to_reference_id)
     conn.commit()
 
     embeddable_kinds = ("title", "abstract", "fulltext_chunk", "annotation", "note")

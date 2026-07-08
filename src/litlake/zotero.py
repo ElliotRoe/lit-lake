@@ -35,6 +35,8 @@ class ZoteroAnnotation:
     sort_index: str
     position: str
     is_external: int
+    date_added: str | None = None
+    date_modified: str | None = None
 
 
 @dataclass
@@ -57,6 +59,21 @@ class ZoteroItem:
     attachments: list[ZoteroAttachment] = field(default_factory=list)
     annotations: list[ZoteroAnnotation] = field(default_factory=list)
     notes: list[ZoteroNote] = field(default_factory=list)
+
+
+
+@dataclass
+class ZoteroCollection:
+    collection_id: int
+    key: str
+    name: str
+    parent_collection_id: int | None
+
+
+@dataclass
+class ZoteroCollectionMembership:
+    collection_id: int
+    item_id: int
 
 
 class ZoteroReader:
@@ -91,6 +108,48 @@ class ZoteroReader:
         if not full_path.exists():
             return None
         return str(full_path)
+
+    def get_collections(self) -> tuple[list[ZoteroCollection], list[ZoteroCollectionMembership]]:
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+
+        collection_rows = conn.execute(
+            """
+            SELECT collectionID, key, collectionName, parentCollectionID
+            FROM collections
+            ORDER BY collectionID
+            """
+        ).fetchall()
+
+        collections = [
+            ZoteroCollection(
+                collection_id=int(row[0]),
+                key=row[1],
+                name=row[2],
+                parent_collection_id=int(row[3]) if row[3] is not None else None,
+            )
+            for row in collection_rows
+        ]
+
+        membership_rows = conn.execute(
+            """
+            SELECT collectionID, itemID
+            FROM collectionItems
+            ORDER BY collectionID, itemID
+            """
+        ).fetchall()
+
+        memberships = [
+            ZoteroCollectionMembership(
+                collection_id=int(row[0]),
+                item_id=int(row[1]),
+            )
+            for row in membership_rows
+        ]
+
+        conn.close()
+        return collections, memberships
+
 
     def get_items(self) -> list[ZoteroItem]:
         conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
@@ -206,7 +265,9 @@ class ZoteroReader:
                 ia.pageLabel,
                 ia.sortIndex,
                 ia.position,
-                ia.isExternal
+                ia.isExternal,
+                ann_item.dateAdded,
+                ann_item.dateModified
             FROM itemAnnotations ia
             JOIN items ann_item ON ann_item.itemID = ia.itemID
             LEFT JOIN itemAttachments att ON att.itemID = ia.parentItemID
@@ -237,6 +298,8 @@ class ZoteroReader:
                     sort_index=row[11] or "",
                     position=row[12] or "",
                     is_external=int(row[13]) if row[13] is not None else 0,
+                    date_added=row[14],
+                    date_modified=row[15],
                 )
             )
 
@@ -277,7 +340,27 @@ class ZoteroReader:
 __all__ = [
     "ZoteroAttachment",
     "ZoteroAnnotation",
+    "ZoteroCollection",
+    "ZoteroCollectionMembership",
     "ZoteroItem",
     "ZoteroNote",
     "ZoteroReader",
 ]
+
+
+@dataclass
+class ZoteroCollection:
+    collection_id: int
+    key: str
+    name: str
+    parent_collection_id: int | None
+
+
+@dataclass 
+class ZoteroCollectionMembership:
+    collection_id: int
+    item_id: int
+
+
+def _get_collections_patch():
+    pass  # placeholder - see next step
