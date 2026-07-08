@@ -54,9 +54,27 @@ class ZoteroItem:
     authors: str | None
     date: str | None
     abstract_note: str | None
+    item_type: str | None = None
+    metadata_fields: dict[str, str] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
     attachments: list[ZoteroAttachment] = field(default_factory=list)
     annotations: list[ZoteroAnnotation] = field(default_factory=list)
     notes: list[ZoteroNote] = field(default_factory=list)
+
+
+
+@dataclass
+class ZoteroCollection:
+    collection_id: int
+    key: str
+    name: str
+    parent_collection_id: int | None
+
+
+@dataclass
+class ZoteroCollectionMembership:
+    collection_id: int
+    item_id: int
 
 
 class ZoteroReader:
@@ -92,6 +110,48 @@ class ZoteroReader:
             return None
         return str(full_path)
 
+    def get_collections(self) -> tuple[list[ZoteroCollection], list[ZoteroCollectionMembership]]:
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+
+        collection_rows = conn.execute(
+            """
+            SELECT collectionID, key, collectionName, parentCollectionID
+            FROM collections
+            ORDER BY collectionID
+            """
+        ).fetchall()
+
+        collections = [
+            ZoteroCollection(
+                collection_id=int(row[0]),
+                key=row[1],
+                name=row[2],
+                parent_collection_id=int(row[3]) if row[3] is not None else None,
+            )
+            for row in collection_rows
+        ]
+
+        membership_rows = conn.execute(
+            """
+            SELECT collectionID, itemID
+            FROM collectionItems
+            ORDER BY collectionID, itemID
+            """
+        ).fetchall()
+
+        memberships = [
+            ZoteroCollectionMembership(
+                collection_id=int(row[0]),
+                item_id=int(row[1]),
+            )
+            for row in membership_rows
+        ]
+
+        conn.close()
+        return collections, memberships
+
+
     def get_items(self) -> list[ZoteroItem]:
         conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
@@ -100,6 +160,7 @@ class ZoteroReader:
             SELECT
                 i.itemID,
                 i.key,
+                it.typeName as item_type,
                 title_val.value as title,
                 abstract_val.value as abstract,
                 SUBSTR(date_val.value, 1, 4) as date,
@@ -137,14 +198,61 @@ class ZoteroReader:
             ZoteroItem(
                 item_id=int(r[0]),
                 key=r[1],
-                title=r[2],
-                abstract_note=r[3],
-                date=r[4],
-                authors=r[5],
+                title=r[3],
+                abstract_note=r[4],
+                date=r[5],
+                authors=r[6],
+                item_type=r[2],
             )
             for r in rows
         ]
         items_by_id = {item.item_id: item for item in items}
+
+        # Load all metadata fields (itemData) for non-attachment/note/annotation items
+        metadata_rows = conn.execute(
+            """
+            SELECT
+                id.itemID,
+                f.fieldName,
+                idv.value
+            FROM itemData id
+            JOIN fields f ON f.fieldID = id.fieldID
+            JOIN itemDataValues idv ON idv.valueID = id.valueID
+            WHERE id.itemID IN (
+                SELECT i.itemID FROM items i
+                JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
+                WHERE it.typeName NOT IN ('attachment', 'note', 'annotation')
+            )
+            """
+        ).fetchall()
+        for row in metadata_rows:
+            item = items_by_id.get(int(row[0]))
+            if item is not None:
+                field_name = str(row[1])
+                # Skip fields already stored as top-level attributes
+                if field_name not in ('title', 'abstractNote'):
+                    item.metadata_fields[field_name] = str(row[2])
+
+        # Load tags for all items
+        tag_rows = conn.execute(
+            """
+            SELECT
+                it.itemID,
+                t.name
+            FROM itemTags it
+            JOIN tags t ON t.tagID = it.tagID
+            WHERE it.itemID IN (
+                SELECT i.itemID FROM items i
+                JOIN itemTypes itype ON i.itemTypeID = itype.itemTypeID
+                WHERE itype.typeName NOT IN ('attachment', 'note', 'annotation')
+            )
+            ORDER BY it.itemID, t.name
+            """
+        ).fetchall()
+        for row in tag_rows:
+            item = items_by_id.get(int(row[0]))
+            if item is not None:
+                item.tags.append(str(row[1]))
 
         attachment_placeholders = ",".join("?" for _ in SUPPORTED_EXTRACTION_MIME_TYPES)
         attachment_rows = conn.execute(
@@ -277,7 +385,27 @@ class ZoteroReader:
 __all__ = [
     "ZoteroAttachment",
     "ZoteroAnnotation",
+    "ZoteroCollection",
+    "ZoteroCollectionMembership",
     "ZoteroItem",
     "ZoteroNote",
     "ZoteroReader",
 ]
+
+
+@dataclass
+class ZoteroCollection:
+    collection_id: int
+    key: str
+    name: str
+    parent_collection_id: int | None
+
+
+@dataclass 
+class ZoteroCollectionMembership:
+    collection_id: int
+    item_id: int
+
+
+def _get_collections_patch():
+    pass  # placeholder - see next step

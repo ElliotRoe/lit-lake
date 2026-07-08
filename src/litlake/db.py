@@ -26,12 +26,13 @@ def utc_now_iso() -> str:
 
 def connect_db(path: Path | str, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
-        conn = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True, check_same_thread=False)
+        conn = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True, check_same_thread=False, timeout=30, isolation_level=None)
     else:
-        conn = sqlite3.connect(str(path), check_same_thread=False)
+        conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000;")
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA locking_mode=NORMAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     _load_sqlite_vec(conn)
     return conn
@@ -157,6 +158,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "document_files", "storage_kind", "storage_kind TEXT DEFAULT 'local'")
     _ensure_column(conn, "document_files", "storage_uri", "storage_uri TEXT")
 
+    # Bibliographic metadata fields (Issue #18)
+    _ensure_column(conn, "reference_items", "item_type", "item_type TEXT")
+
     _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_documents_reference_id ON documents(reference_id)")
     _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_documents_kind ON documents(kind)")
     _ensure_index(
@@ -274,6 +278,63 @@ def init_db(conn: sqlite3.Connection) -> None:
             )
         else:
             raise
+
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zotero_collection_id INTEGER NOT NULL UNIQUE,
+            zotero_key TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            parent_zotero_collection_id INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collection_items (
+            collection_id INTEGER NOT NULL,
+            reference_id INTEGER NOT NULL,
+            PRIMARY KEY (collection_id, reference_id),
+            FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+            FOREIGN KEY(reference_id) REFERENCES reference_items(id) ON DELETE CASCADE
+        )
+        """
+    )
+    _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_collection_items_reference ON collection_items(reference_id)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zotero_collection_id INTEGER UNIQUE,
+            zotero_key TEXT,
+            name TEXT NOT NULL,
+            parent_zotero_collection_id INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collection_items (
+            collection_id INTEGER NOT NULL,
+            reference_id INTEGER NOT NULL,
+            PRIMARY KEY (collection_id, reference_id),
+            FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+            FOREIGN KEY(reference_id) REFERENCES reference_items(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    _ensure_index(conn, "CREATE INDEX IF NOT EXISTS idx_collection_items_reference_id ON collection_items(reference_id)")
+
 
     conn.commit()
 
