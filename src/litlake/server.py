@@ -134,12 +134,14 @@ def _background_init(state: AppState) -> None:
                 ",".join(sorted(extraction_providers[0].supported_mime_types)),
             )
 
-            state.init_message = InitStatus.LOADING_EMBED
-            embedding_provider = _select_embedding_provider(state.settings)
+        # Model loading OUTSIDE the lock so sync_zotero_tool can proceed
+        state.init_message = InitStatus.LOADING_EMBED
+        embedding_provider = _select_embedding_provider(state.settings)
 
-            state.init_message = InitStatus.LOADING_RERANK
-            rerank_provider = _select_rerank_provider(state.settings)
+        state.init_message = InitStatus.LOADING_RERANK
+        rerank_provider = _select_rerank_provider(state.settings)
 
+        with state.conn_lock:
             register_ai_functions(state.conn, embedding_provider, rerank_provider)
 
         queue_policy = QueuePolicy(
@@ -285,20 +287,35 @@ def _resolve_claude_mcp_log_path() -> Path | None:
     annotations=ToolAnnotations(title="Sync Zotero Library", readOnlyHint=False, destructiveHint=False),
 )
 def sync_zotero_tool(ctx: Context) -> str:
+    import time
     state = _state(ctx)
-    with state.conn_lock:
-        result = sync_zotero(
-            state.conn,
-            queue_max_attempts=state.settings.queue_max_attempts,
-            explicit_db_path=state.settings.zotero_db_path,
-        )
+    last_exc = None
+    for attempt in range(10):
+        try:
+            sync_conn = connect_db(state.settings.paths.db_path)
+            try:
+                result = sync_zotero(
+                    sync_conn,
+                    queue_max_attempts=state.settings.queue_max_attempts,
+                    explicit_db_path=state.settings.zotero_db_path,
+                )
+            finally:
+                sync_conn.close()
 
-    if state.embedding_worker is not None:
-        state.embedding_worker.wake()
-    if state.extraction_worker is not None:
-        state.extraction_worker.wake()
+            if state.embedding_worker is not None:
+                state.embedding_worker.wake()
+            if state.extraction_worker is not None:
+                state.extraction_worker.wake()
 
-    return result
+            return result
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("sync_zotero_tool attempt %d failed: %s", attempt, exc)
+            if "locked" in str(exc).lower():
+                time.sleep(2)
+                continue
+            raise
+    raise last_exc
 
 
 @mcp.tool(
