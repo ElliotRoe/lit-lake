@@ -199,6 +199,7 @@ class ChunkArtifact:
     content: str
     page_start: int | None = None
     page_end: int | None = None
+    rects: list[tuple[float, float, float, float]] | None = None  # bbox coords for Zotero annotations
 
 
 class ChunkingProvider(Protocol):
@@ -206,6 +207,38 @@ class ChunkingProvider(Protocol):
 
     def chunk(self, extraction: ExtractionResult) -> list[ChunkArtifact]:
         ...
+
+
+def _extract_rects_for_chunk(
+    chunk_text: str,
+    page_start: int | None,
+    page_end: int | None,
+    page_blocks: list[list[dict]],
+) -> list[tuple[float, float, float, float]] | None:
+    """Find bounding boxes in page_blocks that overlap with chunk_text."""
+    if page_start is None:
+        return None
+
+    chunk_words = set(chunk_text.lower().split())
+    rects: list[tuple[float, float, float, float]] = []
+
+    start_idx = (page_start - 1) if page_start else 0
+    end_idx = (page_end) if page_end else (page_start)
+    end_idx = min(end_idx, len(page_blocks))
+
+    for page_idx in range(start_idx, end_idx):
+        if page_idx >= len(page_blocks):
+            break
+        for block in page_blocks[page_idx]:
+            block_text = block.get("text", "").lower()
+            block_words = set(block_text.split())
+            overlap = chunk_words & block_words
+            if len(overlap) >= min(5, len(chunk_words) // 4):
+                bbox = block.get("bbox")
+                if bbox:
+                    rects.append(tuple(bbox))
+
+    return rects if rects else None
 
 
 @dataclass
@@ -234,11 +267,17 @@ class PdfChunkingProvider:
                     f"PDF chunker produced empty chunk at index={idx}"
                 )
             page_start, page_end = page_spans[idx]
+            rects = (
+                _extract_rects_for_chunk(chunk_text, page_start, page_end, extraction.page_blocks)
+                if extraction.page_blocks is not None and page_start is not None
+                else None
+            )
             artifacts.append(
                 ChunkArtifact(
                     content=chunk_text,
                     page_start=page_start,
                     page_end=page_end,
+                    rects=rects,
                 )
             )
 
